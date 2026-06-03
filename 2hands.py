@@ -98,33 +98,35 @@ while cap.isOpened():
             current_detected_hands.append(hand_type)
             state = hand_states[hand_type]
             state['active'] = True
-	
+    
             features = extract_hand_features(hand_landmarks)
             
-        # Y座標を取得
-        # (一番上が0.0、下が1.0)
+            # Y座標を取得
+            # (一番上が0.0、下が1.0)
             y = features['index_y']
-        
-        if CHORD_MODE:
-            # 和音だけ
-            # Cメジャー
-            index = int((1.0 - y) * len(ALLOWED_NOTES))
-            # 範囲以外を防止する処理
-            index = max(0, min(len(ALLOWED_NOTES) - 1, index))
-            note = ALLOWED_NOTES[index]
-        else:
-            # Y座標をMIDIノートナンバー (例: C4(60) ~ C6(84)) に変換
-            # 手を上にかざす(yが小さい)ほど音が高くなるように計算
-            note = int((1.0 - y) * 24) + 60 
-            note = max(0, min(127, note))
+            
+            if CHORD_MODE:
+                # 和音だけ
+                # Cメジャー
+                index = int((1.0 - y) * len(ALLOWED_NOTES))
+                # 範囲以外を防止する処理
+                index = max(0, min(len(ALLOWED_NOTES) - 1, index))
+                note = ALLOWED_NOTES[index]
+            else:
+                # Y座標をMIDIノートナンバー (例: C4(60) ~ C6(84)) に変換
+                # 手を上にかざす(yが小さい)ほど音が高くなるように計算
+                note = int((1.0 - y) * 24) + 60 
+                note = max(0, min(127, note))
 
-        cc_value = int(features['pinch'] * 127)
-        cc_value = max(0, min(127, cc_value))
+            cc_value = int(features['pinch'] * 127)
+            cc_value = max(0, min(127, cc_value))
 
-        
-        # MIDI信号を送信
-        if note != state['note']:
-            if state['note'] is not None:
+            # 💡【復活させた1行】音量(手の開き)のMIDI送信
+            outport.send(mido.Message('control_change', control=7, value=cc_value, channel=state['channel']))
+            
+            # MIDI信号を送信
+            if note != state['note']:
+                if state['note'] is not None:
                     outport.send(mido.Message('note_off', note=state['note'], channel=state['channel']))
                 outport.send(mido.Message('note_on', note=note, velocity=100, channel=state['channel']))
                 state['note'] = note
