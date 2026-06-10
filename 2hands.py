@@ -6,36 +6,20 @@ from mediapipe.tasks.python import vision
 import mido
 
 # =======
-# 和音を定義する配列
+# 和音や音階リストを定義する配列
 # =======
 
-# =======
-# 和音を定義する配列（コードごとに分離）
-# =======
 CHORD_MODE = True
+# C3(48), E3(52), G3(55), C4(60), E4(64), G4(67), C5(72), E5(76), G5(79), C6(84)
+# C3(48), D3(50), E3(52), F3(53), G3(55), A4(57), B4(59), C4(60)
+ALLOWED_NOTES = [48, 50, 52, 53, 55, 57, 59, 60]
 
-# 各メジャーコードの構成音を定義
-CHORD_MAP = {
-    'C':  [48, 52, 55, 60, 64, 67, 72, 76, 79], # Cメジャー
-    'D':  [50, 54, 57, 62, 66, 69, 74, 78, 81], # Dメジャー
-    'E':  [52, 56, 59, 64, 68, 71, 76, 80, 83], # Eメジャー
-    'F':  [53, 57, 60, 65, 69, 72, 77, 81, 84], # Fメジャー
-    'G':  [55, 59, 62, 67, 71, 74, 79, 83, 86], # Gメジャー
-    'A':  [57, 61, 64, 69, 73, 76, 81, 85, 88], # Aメジャー
-    'B':  [59, 63, 66, 71, 75, 78, 83, 87, 90]  # Bメジャー
+KEY_PRESETS = {
+    'C_major': [48, 50, 52, 53, 55, 57, 59, 60, 62, 64, 65, 67], # ハ長調（C, D, E, F, G, A, B...）
+    'A_minor': [45, 47, 48, 50, 52, 53, 55, 57, 59, 60, 62, 64], # イ短調（A, B, C, D, E, F, G...）
+    'G_major': [43, 45, 47, 48, 50, 52, 54, 55, 57, 59, 60, 62]  # ト長調（Fが#する例: 54番）
 }
-
-# キーのリスト（手の高さでどれを選ぶか決める用）
-CHORD_KEYS = ['C', 'D', 'E', 'F', 'G', 'A', 'B']
-
-ALLOWED_NOTES = CHORD_MAP['C']
-
-cap = cv2.VideoCapture(0)
-hand_states = {
-    'Right': {'note': None, 'channel': 0, 'active': False},
-    'Left':  {'note': None, 'channel': 1, 'active': False}
-}
-
+CURRENT_KEY = 'C_major'
 
 # ==========================================
 # わけわからん
@@ -127,13 +111,8 @@ while cap.isOpened():
             # (一番上が0.0、下が1.0)
             y = features['index_y']
             
-            if hand_type == 'Left':
-                chord_index = int((1.0 - y) * len(CHORD_KEYS))
-                chord_index = max(0, min(len(CHORD_KEYS) - 1, chord_index))
-                # ALLOWED_NOTES の中身を丸ごと現在のコードの配列に上書き
-                ALLOWED_NOTES = CHORD_MAP[CHORD_KEYS[chord_index]]
-
             if CHORD_MODE:
+                ALLOWED_NOTES = KEY_PRESETS[CURRENT_KEY]
                 # 和音だけ
                 # Cメジャー
                 index = int((1.0 - y) * len(ALLOWED_NOTES))
@@ -172,8 +151,20 @@ while cap.isOpened():
     # 5. カメラ映像の表示
     # ==========================================
     cv2.imshow('Theremin Camera', image)
-    if cv2.waitKey(5) & 0xFF == 27: # Escキーで終了
-        break
+    
+    key = cv2.waitKey(5)
+    
+    if key != -1:  # 何かキーが押された場合のみ処理
+        key = key & 0xFF  # 特殊キー対策のマスク処理
+        
+        if key == 27:  # Escキーで終了
+            break
+        elif key == ord('c'):  # 'c'キーでハ長調に
+            CURRENT_KEY = 'C_major'
+            print("【切替】ハ長調 (C Major) になりました")
+        elif key == ord('a'):  # 'a'キーでイ短調に
+            CURRENT_KEY = 'A_minor'
+            print("【切替】イ短調 (A Minor) になりました")
 
 # 終了処理
 cap.release()
