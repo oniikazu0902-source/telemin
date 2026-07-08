@@ -290,6 +290,7 @@ hand_states = {
         'notes': set(), 
         'pinch_start_x': None, 
         'pinch_start_y': None, 
+        'y_smooth': None,
         'channel': 0, 
         'active': False
     },
@@ -298,6 +299,7 @@ hand_states = {
         'notes': set(), 
         'pinch_start_x': None, 
         'pinch_start_y': None, 
+        'y_smooth': None,
         'channel': 1, 
         'active': False
     }
@@ -399,13 +401,22 @@ try:
                 y = max(Y_MIN_LIMIT, min(Y_MAX_LIMIT, y))
                 y_scaled = (y - Y_MIN_LIMIT) / (Y_MAX_LIMIT - Y_MIN_LIMIT)
                 
+                # 指の震え（チャタリング）を抑えるための指数移動平均（EMA）フィルター
+                EMA_ALPHA = 0.20  # 小さいほど滑らかになりますが、応答遅延がわずかに増えます
+                if state['y_smooth'] is None:
+                    state['y_smooth'] = y_scaled
+                else:
+                    state['y_smooth'] = EMA_ALPHA * y_scaled + (1.0 - EMA_ALPHA) * state['y_smooth']
+                
+                y_scaled_final = state['y_smooth']
+                
                 if CHORD_MODE:
                     ALLOWED_NOTES = KEY_PRESETS[CURRENT_KEY]
-                    index = int((1.0 - y_scaled) * len(ALLOWED_NOTES))
+                    index = int((1.0 - y_scaled_final) * len(ALLOWED_NOTES))
                     index = max(0, min(len(ALLOWED_NOTES) - 1, index))
                     note = ALLOWED_NOTES[index]
                 else:
-                    note = int((1.0 - y_scaled) * 24) + 60 
+                    note = int((1.0 - y_scaled_final) * 24) + 60 
                     note = max(0, min(127, note))
 
                 # 【機能追加】左手の場合は1オクターブ下げるロジック
@@ -446,7 +457,7 @@ try:
                             idx_start = int((1.0 - y_start_scaled) * len(ALLOWED_NOTES))
                             idx_start = max(0, min(len(ALLOWED_NOTES) - 1, idx_start))
                             
-                            idx_current = int((1.0 - y_scaled) * len(ALLOWED_NOTES))
+                            idx_current = int((1.0 - y_scaled_final) * len(ALLOWED_NOTES))
                             idx_current = max(0, min(len(ALLOWED_NOTES) - 1, idx_current))
                             
                             # 開始インデックスから現在インデックスまでの範囲
@@ -514,8 +525,10 @@ try:
                             outport.send(mido.Message('note_on', note=note, velocity=100, channel=state['channel']))
                             state['note'] = note
                         elif state['note'] != note:
-                            outport.send(mido.Message('note_off', note=state['note'], channel=state['channel']))
+                            old_note = state['note']
+                            # 先に新しい音を鳴らしてから古い音を止めることで、シンセのレガート・ポルタメント（滑らかなスライド）を有効にします
                             outport.send(mido.Message('note_on', note=note, velocity=100, channel=state['channel']))
+                            outport.send(mido.Message('note_off', note=old_note, channel=state['channel']))
                             state['note'] = note
                     else:
                         if state['note'] is not None:
@@ -550,6 +563,7 @@ try:
                         state['notes'].clear()
                     state['pinch_start_x'] = None
                     state['pinch_start_y'] = None
+                    state['y_smooth'] = None  # 手が消えたらスムージングを初期化
                     state['active'] = False
 
         # ==========================================
