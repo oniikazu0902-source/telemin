@@ -575,7 +575,29 @@ try:
             # ------------------------------------
             # 演奏画面 (PLAY)
             # ------------------------------------
-            # 有効演奏エリアの境界線
+            # 音程の境界線（薄いガイドライン）と音名表示の描画
+            notes_in_scale = KEY_PRESETS[CURRENT_KEY] if CHORD_MODE else [60 + i for i in range(24)]
+            N = len(notes_in_scale)
+            for i in range(N):
+                # 各音程レーンの上下境界を計算
+                y_scaled_top = (N - 1 - i) / N
+                y_scaled_bottom = (N - i) / N
+                
+                y_top = Y_MIN_LIMIT + y_scaled_top * (Y_MAX_LIMIT - Y_MIN_LIMIT)
+                y_bottom = Y_MIN_LIMIT + y_scaled_bottom * (Y_MAX_LIMIT - Y_MIN_LIMIT)
+                
+                # レーンの境界線を描画（最上部/最下部を除く内側の線）
+                if i < N - 1:
+                    y_px = int(h * y_top)
+                    cv2.line(image, (0, y_px), (w, y_px), (55, 55, 55), 1)
+                
+                # レーンの中央に音名（C4, D4等）を表示
+                y_center_px = int(h * (y_top + y_bottom) / 2)
+                note_val = notes_in_scale[i]
+                note_name = midi_to_note_name(note_val)
+                cv2.putText(image, note_name, (15, y_center_px + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (110, 110, 110), 1)
+
+            # 有効演奏エリアの最上部・最下部の境界線
             cv2.line(image, (0, int(h * Y_MIN_LIMIT)), (w, int(h * Y_MIN_LIMIT)), (0, 0, 255), 2)
             cv2.line(image, (0, int(h * Y_MAX_LIMIT)), (w, int(h * Y_MAX_LIMIT)), (0, 0, 255), 2)
             
