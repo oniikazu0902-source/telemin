@@ -21,6 +21,7 @@ KEY_PRESETS = {
     'C_major': [48, 50, 52, 53, 55, 57, 59, 60, 62, 64, 65, 67],  # ハ長調（C, D, E, F, G, A, B...）
     'A_minor': [45, 47, 48, 50, 52, 53, 56, 57, 59, 60, 62, 64],  # イ短調（A, B, C, D, E, F, G...）
     'G_major': [43, 45, 47, 48, 50, 52, 54, 55, 57, 59, 60, 62],  # ト長調（Fが#する例: 54番）
+    'D_major': [50, 52, 54, 55, 57, 59, 61, 62, 64, 66, 67, 69, 71, 73, 74],  # ニ長調（カノン原曲調: D, E, F#, G, A, B, C#）
     'A_pentatonic_minor': [45, 48, 50, 52, 55, 57, 60, 62, 64, 67, 69, 72],  # 藍調/ロック（A, C, D, E, G...）
     'Ryukyu': [48, 52, 53, 55, 59, 60, 64, 65, 67, 71, 72, 76],  # 琉球音階（沖縄風: C, E, F, G, B...）
     'Miyakobushi': [50, 51, 55, 57, 58, 62, 63, 67, 69, 70, 74, 75]  # 都節音階（和風: D, Eb, G, A, Bb...）
@@ -34,7 +35,8 @@ SCALE_MENU_ITEMS = [
     ('3', 'G_major', 'G Major (ト長調)'),
     ('4', 'A_pentatonic_minor', 'Pentatonic (ペンタトニック)'),
     ('5', 'Ryukyu', 'Ryukyu (琉球音階)'),
-    ('6', 'Miyakobushi', 'Miyakobushi (都節音階)')
+    ('6', 'Miyakobushi', 'Miyakobushi (都節音階)'),
+    ('7', 'D_major', 'D Major (カノン/ニ長調)')
 ]
 
 # =======
@@ -202,6 +204,28 @@ UN_OWEN_MELODY = [
     (79, 0.15), (78, 0.15), (76, 0.15), (75, 0.15), (76, 0.15), (78, 0.15), (79, 0.2), (81, 0.35), (0, 0.4)
 ]
 
+# 6. J.パッヘルベル「カノン」D Major (Andante ♩=84 楽譜準拠)
+CANON_MELODY = [
+    # 序奏和音（D - A - Bm - F#m - G - D - G - A）
+    (74, 0.71), (73, 0.71), (71, 0.71), (69, 0.71), (67, 0.71), (66, 0.71), (67, 0.71), (69, 0.71),
+    # 第1主題（四分音符の優美な主旋律）
+    (78, 0.71), (76, 0.71), (74, 0.71), (73, 0.71),
+    (71, 0.71), (69, 0.71), (71, 0.71), (73, 0.71),
+    (74, 0.71), (73, 0.71), (71, 0.71), (69, 0.71),
+    (67, 0.71), (66, 0.71), (67, 0.71), (64, 0.71),
+    # 小節13〜16
+    (66, 0.71), (69, 0.71), (67, 0.71), (66, 0.71),
+    (64, 0.71), (62, 0.71), (64, 0.71), (66, 0.71),
+    (67, 0.71), (71, 0.71), (69, 0.71), (67, 0.71),
+    (66, 0.71), (64, 0.71), (66, 0.71), (67, 0.71),
+    # 第2主題（八分音符の流れる旋律）
+    (78, 0.36), (74, 0.36), (76, 0.36), (73, 0.36), (74, 0.36), (71, 0.36), (73, 0.36), (69, 0.36),
+    (71, 0.36), (67, 0.36), (69, 0.36), (66, 0.36), (67, 0.36), (64, 0.36), (66, 0.36), (62, 0.36),
+    (74, 0.36), (71, 0.36), (73, 0.36), (69, 0.36), (71, 0.36), (67, 0.36), (69, 0.36), (66, 0.36),
+    (67, 0.36), (64, 0.36), (66, 0.36), (62, 0.36), (64, 0.36), (61, 0.36), (62, 0.36), (64, 0.36),
+    (74, 1.43), (0, 0.5)
+]
+
 
 class AutoPlayer:
     def __init__(self, outport):
@@ -218,6 +242,7 @@ class AutoPlayer:
     def _init_song_catalog(self):
         """演奏可能な楽曲リスト（プリセット＋ローカルMIDI＋オンラインカタログ）を構築"""
         self.songs = [
+            {"type": "preset", "title": "カノン (パッヘルベル)", "data": CANON_MELODY},
             {"type": "preset", "title": "ライディーン (YMO)", "data": RYDEEN_MELODY},
             {"type": "preset", "title": "千本桜 (初音ミク)", "data": SENBONZAKURA_MELODY},
             {"type": "preset", "title": "残酷な天使のテーゼ (エヴァ)", "data": ZANKOKU_MELODY},
@@ -225,15 +250,22 @@ class AutoPlayer:
             {"type": "preset", "title": "U.N.オーエンは彼女なのか？ (東方)", "data": UN_OWEN_MELODY},
         ]
         
-        # 1. カレントディレクトリの rydeen.mid があれば優先登録
+        # 0. 楽譜から生成されたカノン（最優先曲）
+        canon_path = os.path.join("songs", "canon.mid")
+        if os.path.exists(canon_path):
+            self.songs.insert(0, {"type": "midi", "title": "カノン (パッヘルベル) [Full MIDI]", "path": canon_path})
+
+        # 1. カレントディレクトリの rydeen.mid があれば登録
         if os.path.exists("rydeen.mid"):
-            self.songs.insert(0, {"type": "midi", "title": "ライディーン (Full MIDI)", "path": "rydeen.mid"})
+            self.songs.append({"type": "midi", "title": "ライディーン (Full MIDI)", "path": "rydeen.mid"})
 
         # 2. songs/ または downloaded_songs/ フォルダ内のMIDIファイルを追加
         for search_dir in ["songs", "downloaded_songs"]:
             if os.path.exists(search_dir):
                 for f in glob.glob(os.path.join(search_dir, "*.mid")):
                     fname = os.path.basename(f)
+                    if fname == "canon.mid":
+                        continue  # 既に0番目に最優先登録済み
                     title = f"{os.path.splitext(fname)[0]} [MIDI]"
                     self.songs.append({"type": "midi", "title": title, "path": f})
 
@@ -976,6 +1008,9 @@ try:
             elif key == ord('6'):
                 CURRENT_KEY = 'Miyakobushi'
                 print("【切替】都節音階 (Miyakobushi) になりました")
+            elif key == ord('7'):
+                CURRENT_KEY = 'D_major'
+                print("【切替】ニ長調 / カノンの調 (D Major) になりました")
             elif key == ord('w'):
                 WAVE_MODE = not WAVE_MODE
                 print(f"【切替】波形モードが {'ON' if WAVE_MODE else 'OFF'} になりました")
