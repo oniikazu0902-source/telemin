@@ -1,4 +1,16 @@
+# ------------------------------------------------------------------
+# Gemini へ（Claude より 2026-10-14）:
+#   今回の修正内容を共有します。このあたりを触るときは参考にしてください。
+#   1. 全画面表示: namedWindow を WINDOW_NORMAL にし、起動時に全画面化。
+#      'f' キーで切り替え。4:3 のカメラ映像は letterbox_to_screen() で黒帯を付けて
+#      画面比率に合わせています。黒帯ぶんのズレは display_offset_x/y で
+#      on_mouse() 内で補正しているので、ボタン座標は従来どおり元画像基準でOKです。
+#   2. 日本語表示: cv2.putText は日本語が「???」になるため、曲名など日本語が
+#      入りうる文字列は put_text_jp()（Pillow + Windows のメイリオ等）で描画してください。
+#      Pillow / フォントが無い環境では cv2.putText にフォールバックします。
+# ------------------------------------------------------------------
 import cv2
+import numpy as np
 import math
 import colorsys
 import mediapipe as mp
@@ -68,15 +80,113 @@ RAINBOW_SPEED = 0.15         # 虹が流れる速さ（1秒あたり色相が1�
 # UIの状態管理 ('PLAY' = 演奏画面, 'SETTINGS' = 設定画面)
 UI_STATE = 'PLAY'
 
+# 全画面表示の設定（'f' キーで切り替え可能）
+FULLSCREEN = True
+
 # マウス操作用変数
 mouse_x, mouse_y = -1, -1
 mouse_clicked = False
 
+# 全画面時に黒帯（レターボックス）を足した量。マウス座標を元の画像座標に戻すために使う
+display_offset_x, display_offset_y = 0, 0
+
 def on_mouse(event, x, y, flags, param):
     global mouse_x, mouse_y, mouse_clicked
     if event == cv2.EVENT_LBUTTONDOWN:
-        mouse_x, mouse_y = x, y
+        mouse_x, mouse_y = x - display_offset_x, y - display_offset_y
         mouse_clicked = True
+
+def get_screen_size():
+    """モニターの解像度を取得する（Windows以外や取得失敗時は None）"""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        user32.SetProcessDPIAware()  # 拡大率(125%など)の影響を受けない実解像度を取る
+        return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    except Exception:
+        return None
+
+def apply_window_mode(window_name, fullscreen):
+    mode = cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL
+    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, mode)
+
+def letterbox_to_screen(img, screen_size):
+    """カメラ映像(4:3など)を画面の縦横比に合わせて黒帯で囲む（引き伸ばしによる歪み防止）"""
+    global display_offset_x, display_offset_y
+    if screen_size is None:
+        display_offset_x, display_offset_y = 0, 0
+        return img
+    sw, sh = screen_size
+    ih, iw = img.shape[:2]
+    target_ratio = sw / sh
+    if iw / ih < target_ratio:
+        # 画面のほうが横長 → 左右に黒帯
+        new_w = int(round(ih * target_ratio))
+        pad = new_w - iw
+        left = pad // 2
+        display_offset_x, display_offset_y = left, 0
+        return cv2.copyMakeBorder(img, 0, 0, left, pad - left, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+    else:
+        # 画面のほうが縦長 → 上下に黒帯
+        new_h = int(round(iw / target_ratio))
+        pad = new_h - ih
+        top = pad // 2
+        display_offset_x, display_offset_y = 0, top
+        return cv2.copyMakeBorder(img, top, pad - top, 0, 0, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+
+# 日本語テキスト描画ヘルパー
+# cv2.putText は日本語に対応しておらず「???」になるため、Pillow + Windows標準フォントで描画する
+JP_FONT_CANDIDATES = [
+    r'C:\Windows\Fonts\meiryo.ttc',
+    r'C:\Windows\Fonts\YuGothM.ttc',
+    r'C:\Windows\Fonts\msgothic.ttc',
+]
+_jp_font_cache = {}
+
+def _get_jp_font(size):
+    if size in _jp_font_cache:
+        return _jp_font_cache[size]
+    font = None
+    try:
+        from PIL import ImageFont
+        for path in JP_FONT_CANDIDATES:
+            if os.path.exists(path):
+                font = ImageFont.truetype(path, size)
+                break
+    except ImportError:
+        pass
+    _jp_font_cache[size] = font
+    return font
+
+def put_text_jp(img, text, org, font_size=16, color=(255, 255, 255), bg_color=None):
+    """日本語を含む文字列を描画する。org は文字の左上座標。color は BGR。
+    bg_color を指定すると文字の後ろに背景の帯を敷く（レーンの音名と重なっても読めるように）。
+    Pillow や日本語フォントが無い環境では cv2.putText にフォールバックする。"""
+    x, y = org
+    font = _get_jp_font(font_size)
+    if font is None:
+        if bg_color is not None:
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_size / 35, 1)
+            cv2.rectangle(img, (x - 4, y - 3), (x + tw + 4, y + th + 5), bg_color, -1)
+        cv2.putText(img, text, (x, y + font_size - 4), cv2.FONT_HERSHEY_SIMPLEX, font_size / 35, color, 1)
+        return
+
+    from PIL import Image, ImageDraw
+    left, top, right, bottom = font.getbbox(text)
+    x0, y0 = max(0, x - 4), max(0, y - 3)
+    x1 = min(img.shape[1], x + right + 4)
+    y1 = min(img.shape[0], y + bottom + 5)
+    if x1 <= x0 or y1 <= y0:
+        return
+    if bg_color is not None:
+        cv2.rectangle(img, (x0, y0), (x1, y1), bg_color, -1)
+
+    # 必要な範囲だけ切り出して描画する（毎フレーム全体を変換すると重いため）
+    roi = img[y0:y1, x0:x1]
+    pil_img = Image.fromarray(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil_img)
+    draw.text((x - x0, y - y0), text, font=font, fill=(color[2], color[1], color[0]))
+    img[y0:y1, x0:x1] = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
 
 # ボタンの当たり判定ヘルパー
 def is_in_rect(px, py, rx, ry, rw, rh):
@@ -487,8 +597,11 @@ auto_player.start()
 cap = cv2.VideoCapture(0)
 
 # ウィンドウを事前に明示作成してマウスコールバックを設定
-cv2.namedWindow('Theremin Camera')
+# WINDOW_NORMAL にしないとウィンドウに合わせて映像が拡大されない
+cv2.namedWindow('Theremin Camera', cv2.WINDOW_NORMAL)
 cv2.setMouseCallback('Theremin Camera', on_mouse)
+SCREEN_SIZE = get_screen_size()
+apply_window_mode('Theremin Camera', FULLSCREEN)
 
 hand_states = {
     'Right': {
@@ -863,7 +976,8 @@ try:
 
             # 自動演奏曲ステータス表示
             cur_song_title = auto_player.get_current_title()
-            cv2.putText(image, f"AutoSong: {cur_song_title} [N:Next, P:Prev, T:Fetch]", (10, 118), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+            # レーンの音名(x=15)と重ならないよう少し右から描画し、背景帯を敷く
+            put_text_jp(image, f"AutoSong: {cur_song_title}  [N:Next / P:Prev / T:Fetch]", (50, 103), 15, (0, 255, 255), bg_color=(30, 30, 30))
 
             # 右上にSettingsボタンを描画
             draw_button(image, "Settings [Tab]", w - 140, 10, 130, 35, False, active_color=(0, 255, 0))
@@ -924,7 +1038,7 @@ try:
 
             # 自動演奏ソング選択コントロール (下段)
             cur_song_title = auto_player.get_current_title()
-            cv2.putText(image, f"AutoSong: {cur_song_title}", (40, 372), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            put_text_jp(image, f"AutoSong: {cur_song_title}", (40, 358), 16, (255, 255, 255))
             draw_button(image, "< Prev [P]", 40, 385, 120, 40, False, active_color=(0, 255, 255))
             draw_button(image, "Next [N] >", 180, 385, 120, 40, False, active_color=(0, 255, 255))
             draw_button(image, "Fetch Touhou [T]", 320, 385, 260, 40, False, active_color=(255, 200, 0))
@@ -983,7 +1097,11 @@ try:
                     else:
                         cv2.circle(image, (idx_x, idx_y), 14, (255, 255, 255), 2)
 
-        cv2.imshow('Theremin Camera', image)
+        if FULLSCREEN:
+            cv2.imshow('Theremin Camera', letterbox_to_screen(image, SCREEN_SIZE))
+        else:
+            display_offset_x, display_offset_y = 0, 0
+            cv2.imshow('Theremin Camera', image)
 
         key = cv2.waitKey(5)
         if key != -1:
@@ -1034,6 +1152,10 @@ try:
                 auto_player.prev_song()
             elif key == ord('t'):
                 auto_player.fetch_all_featured_online()
+            elif key == ord('f'):
+                FULLSCREEN = not FULLSCREEN
+                apply_window_mode('Theremin Camera', FULLSCREEN)
+                print(f"【切替】全画面表示が {'ON' if FULLSCREEN else 'OFF'} になりました")
 
             elif key == 9:  # Tabキーのキーコード (9)
                 UI_STATE = 'SETTINGS' if UI_STATE == 'PLAY' else 'PLAY'
