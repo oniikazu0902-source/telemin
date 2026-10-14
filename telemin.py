@@ -1,13 +1,13 @@
 # ------------------------------------------------------------------
-# Gemini へ（Claude より 2026-10-14）:
-#   今回の修正内容を共有します。このあたりを触るときは参考にしてください。
-#   1. 全画面表示: namedWindow を WINDOW_NORMAL にし、起動時に全画面化。
-#      'f' キーで切り替え。4:3 のカメラ映像は letterbox_to_screen() で黒帯を付けて
-#      画面比率に合わせています。黒帯ぶんのズレは display_offset_x/y で
-#      on_mouse() 内で補正しているので、ボタン座標は従来どおり元画像基準でOKです。
-#   2. 日本語表示: cv2.putText は日本語が「???」になるため、曲名など日本語が
-#      入りうる文字列は put_text_jp()（Pillow + Windows のメイリオ等）で描画してください。
-#      Pillow / フォントが無い環境では cv2.putText にフォールバックします。
+# tElemin - AIテルミン演奏システム
+#   1. 全画面追従表示: WINDOW_NORMAL で起動し、画面やウィンドウ解像度に合わせて
+#      映像表示域・演奏レーンが黒帯なしで自動追従（'f'キーで全画面/通常切替）。
+#   2. 演奏境界制御: Y_MIN_LIMIT / Y_MAX_LIMIT の外側では発音・反応しない安全設計。
+#   3. 高音質MIDI自動演奏: songs/ ディレクトリを動的監視し、delta-time制御・ポリフォニー
+#      リミッター・チャンネル最適化により音の濁りや再開時バーストを完全に防止。
+#   4. トースト表示: 演奏画面では曲切り替え時のみ数秒間表示し、通常演奏画面をクリアに維持。
+#   5. ピンチしきい値調整: キーボード [-] / [+] や設定画面(Tab)から直感的に感度調整可能。
+#   6. 日本語表示: put_text_jp() によりPillow+Windows標準フォントで文字化けなく描画。
 # ------------------------------------------------------------------
 import cv2
 import numpy as np
@@ -55,13 +55,13 @@ SCALE_MENU_ITEMS = [
 # =======
 Y_MIN_LIMIT = 0.15  # これより上（0.0〜0.15）は無視
 Y_MAX_LIMIT = 0.85  # これより下（0.85〜1.0）は無視
-PINCH_THRESHOLD = 0.7  # つまみ判定のしきい値（0.0〜1.0）
+PINCH_THRESHOLD = 0.70  # つまみ判定のしきい値（0.20〜0.95、キーボード[-] / [+]や設定画面で調整可能）
 
 # 波形変化モードのデフォルト状態
 WAVE_MODE = False
 
-# 和音モード（ひも引っ張り発音）のデフォルト状態
-STRUM_MODE = True
+# 和音モード（ひも引っ張り発音）のデフォルト状態（デフォルトOFF）
+STRUM_MODE = False
 
 # 自動演奏モードのデフォルト状態
 AUTO_PLAY_ENABLED = False
@@ -86,13 +86,10 @@ FULLSCREEN = True
 mouse_x, mouse_y = -1, -1
 mouse_clicked = False
 
-# 全画面時に黒帯（レターボックス）を足した量。マウス座標を元の画像座標に戻すために使う
-display_offset_x, display_offset_y = 0, 0
-
 def on_mouse(event, x, y, flags, param):
     global mouse_x, mouse_y, mouse_clicked
     if event == cv2.EVENT_LBUTTONDOWN:
-        mouse_x, mouse_y = x - display_offset_x, y - display_offset_y
+        mouse_x, mouse_y = x, y
         mouse_clicked = True
 
 def get_screen_size():
@@ -109,29 +106,28 @@ def apply_window_mode(window_name, fullscreen):
     mode = cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, mode)
 
-def letterbox_to_screen(img, screen_size):
-    """カメラ映像(4:3など)を画面の縦横比に合わせて黒帯で囲む（引き伸ばしによる歪み防止）"""
-    global display_offset_x, display_offset_y
-    if screen_size is None:
-        display_offset_x, display_offset_y = 0, 0
-        return img
-    sw, sh = screen_size
-    ih, iw = img.shape[:2]
-    target_ratio = sw / sh
-    if iw / ih < target_ratio:
-        # 画面のほうが横長 → 左右に黒帯
-        new_w = int(round(ih * target_ratio))
-        pad = new_w - iw
-        left = pad // 2
-        display_offset_x, display_offset_y = left, 0
-        return cv2.copyMakeBorder(img, 0, 0, left, pad - left, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+def adapt_frame_to_ratio(frame, target_ratio, base_height=480):
+    """画面やウィンドウのアスペクト比に合わせて、カメラ映像を歪みなく中央クロップ＆リサイズして表示域を追従させる"""
+    fh, fw = frame.shape[:2]
+    current_ratio = fw / max(1, fh)
+
+    if current_ratio > target_ratio:
+        # 横が広すぎる場合、左右を均等にクロップ
+        new_w = int(round(fh * target_ratio))
+        start_x = max(0, (fw - new_w) // 2)
+        cropped = frame[:, start_x:start_x + new_w]
+    elif current_ratio < target_ratio:
+        # 縦が長すぎる場合、上下を均等にクロップ
+        new_h = int(round(fw / target_ratio))
+        start_y = max(0, (fh - new_h) // 2)
+        cropped = frame[start_y:start_y + new_h, :]
     else:
-        # 画面のほうが縦長 → 上下に黒帯
-        new_h = int(round(iw / target_ratio))
-        pad = new_h - ih
-        top = pad // 2
-        display_offset_x, display_offset_y = 0, top
-        return cv2.copyMakeBorder(img, top, pad - top, 0, 0, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+        cropped = frame
+
+    target_w = max(640, int(round(base_height * target_ratio)))
+    if cropped.shape[1] != target_w or cropped.shape[0] != base_height:
+        return cv2.resize(cropped, (target_w, base_height), interpolation=cv2.INTER_LINEAR)
+    return cropped
 
 # 日本語テキスト描画ヘルパー
 # cv2.putText は日本語に対応しておらず「???」になるため、Pillow + Windows標準フォントで描画する
@@ -280,6 +276,7 @@ class AutoPlayer:
         self.song_changed = False
         self.songs = []
         self._last_scan_files = []
+        self.title_changed_at = time.time()
 
         # songs フォルダがなければ自動作成
         if not os.path.exists(self.midi_dir):
@@ -348,6 +345,7 @@ class AutoPlayer:
             if not found:
                 self.current_idx = 0
 
+            self.title_changed_at = time.time()
             if self.songs:
                 print(f"【MIDIカタログ更新】{len(self.songs)}曲のMIDIファイルを認識しました。")
             return True
@@ -359,6 +357,7 @@ class AutoPlayer:
                 return
             self.current_idx = (self.current_idx + 1) % len(self.songs)
             self.song_changed = True
+            self.title_changed_at = time.time()
             self._all_notes_off()
             print(f"【自動演奏】次のMIDIへ切替: {self.get_current_title()}")
 
@@ -369,6 +368,7 @@ class AutoPlayer:
                 return
             self.current_idx = (self.current_idx - 1) % len(self.songs)
             self.song_changed = True
+            self.title_changed_at = time.time()
             self._all_notes_off()
             print(f"【自動演奏】前のMIDIへ切替: {self.get_current_title()}")
 
@@ -399,6 +399,10 @@ class AutoPlayer:
         with self.lock:
             if self.paused:
                 self.paused = False
+                self.title_changed_at = time.time()
+                # チャンネルの音量CC#7を100に確実にリセット
+                for ch in range(16):
+                    self.outport.send(mido.Message('control_change', control=7, value=100, channel=ch))
                 print(f"【自動演奏】再開: {self.get_current_title()}")
 
     def stop(self):
@@ -428,16 +432,79 @@ class AutoPlayer:
             if os.path.exists(mid_path):
                 try:
                     mid = mido.MidiFile(mid_path)
-                    print(f"【自動演奏】MIDI再生中: {song['title']}")
-                    for msg in mid.play():
+                    print(f"【自動演奏】MIDI再生開始: {song['title']}")
+
+                    # 再生開始時に音量を健全な値（100）にリセット
+                    for ch in range(16):
+                        self.outport.send(mido.Message('control_change', control=7, value=100, channel=ch))
+
+                    # 発音中ノートを追跡（ポリフォニー制限＆音の濁り防止）
+                    active_notes = {}  # (ch, note) -> timestamp
+                    MAX_POLYPHONY = 10
+                    song_completed_naturally = True
+
+                    for msg in mid:
                         if not self.running or self.song_changed:
+                            song_completed_naturally = False
                             break
+
+                        # デルタタイム待機（一時停止中は実時間を減算しないため、再開時のノート爆発バーストを防ぐ）
+                        dt = msg.time
+                        while dt > 0 and self.running and not self.song_changed:
+                            if self.paused:
+                                time.sleep(0.05)
+                                continue
+                            step = min(dt, 0.02)
+                            time.sleep(step)
+                            dt -= step
+
+                        if not self.running or self.song_changed:
+                            song_completed_naturally = False
+                            break
+
                         while self.paused and self.running and not self.song_changed:
-                            time.sleep(0.1)
-                        if self.song_changed:
+                            time.sleep(0.05)
+
+                        if not self.running or self.song_changed:
+                            song_completed_naturally = False
                             break
-                        if not self.paused:
-                            self.outport.send(msg)
+
+                        # 1. ドラムチャンネル (MIDI ch 10 = index 9) はピッチシンセに不適なため除外
+                        if hasattr(msg, 'channel') and msg.channel == 9:
+                            continue
+
+                        # 2. note_on / note_off のみ厳選送信（外部MIDIのCCやプログラムチェンジによるシンセ誤動作を防止）
+                        if msg.type == 'note_on' and msg.velocity > 0:
+                            key = (msg.channel, msg.note)
+                            # 同音連打時は先に消音
+                            if key in active_notes:
+                                self.outport.send(mido.Message('note_off', note=msg.note, channel=msg.channel))
+                                del active_notes[key]
+
+                            # ポリフォニー上限チェック（音が濁るのを防ぐため最も古い音を消音）
+                            if len(active_notes) >= MAX_POLYPHONY:
+                                oldest_key = min(active_notes, key=active_notes.get)
+                                self.outport.send(mido.Message('note_off', note=oldest_key[1], channel=oldest_key[0]))
+                                del active_notes[oldest_key]
+
+                            # ベロシティを適切な音量帯(55〜110)にノーマライズ
+                            vel = max(55, min(110, msg.velocity))
+                            self.outport.send(mido.Message('note_on', note=msg.note, velocity=vel, channel=msg.channel))
+                            active_notes[key] = time.time()
+
+                        elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
+                            key = (msg.channel, msg.note)
+                            self.outport.send(mido.Message('note_off', note=msg.note, channel=msg.channel))
+                            active_notes.pop(key, None)
+
+                    # 曲が自然終了した場合は次の曲へ自動で進む
+                    if song_completed_naturally and self.running and not self.song_changed:
+                        with self.lock:
+                            if self.songs:
+                                self.current_idx = (self.current_idx + 1) % len(self.songs)
+                                self.title_changed_at = time.time()
+                                print(f"【自動演奏】次の曲へ自動進行: {self.get_current_title()}")
+
                 except Exception as e:
                     print(f"MIDI再生エラー ({song['title']}): {e}")
                     time.sleep(1)
@@ -500,6 +567,9 @@ auto_player.start()
 # 4. カメラの準備とメインループ
 # ==========================================
 cap = cv2.VideoCapture(0)
+# 広角・高画質対応（可能であれば1280x720を要求）
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
 # ウィンドウを事前に明示作成してマウスコールバックを設定
 # WINDOW_NORMAL にしないとウィンドウに合わせて映像が拡大されない
@@ -516,7 +586,8 @@ hand_states = {
         'pinch_start_y': None,
         'y_smooth': None,
         'channel': 0,
-        'active': False
+        'active': False,
+        'pinch': 0.0
     },
     'Left': {
         'note': None,
@@ -525,7 +596,8 @@ hand_states = {
         'pinch_start_y': None,
         'y_smooth': None,
         'channel': 1,
-        'active': False
+        'active': False,
+        'pinch': 0.0
     }
 }
 
@@ -539,9 +611,23 @@ try:
         if not success:
             break
 
-        # 鏡のように反転させ、色をOpenCV標準(BGR)からRGBに変換
+        # 鏡のように反転
         image = cv2.flip(image, 1)
-        h, w, _ = image.shape  # マウス処理でも使うので、ここで先に取得する
+
+        # 全画面またはウィンドウ解像度に合わせて映像表示域を自動追従（黒帯なし）
+        if FULLSCREEN and SCREEN_SIZE is not None:
+            target_ratio = SCREEN_SIZE[0] / max(1, SCREEN_SIZE[1])
+        else:
+            win_rect = cv2.getWindowImageRect('Theremin Camera')
+            if win_rect[2] > 0 and win_rect[3] > 0:
+                target_ratio = win_rect[2] / win_rect[3]
+            elif SCREEN_SIZE is not None:
+                target_ratio = SCREEN_SIZE[0] / max(1, SCREEN_SIZE[1])
+            else:
+                target_ratio = 16.0 / 9.0
+
+        image = adapt_frame_to_ratio(image, target_ratio, base_height=480)
+        h, w, _ = image.shape
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         # MediaPipe専用の画像フォーマットに変換してAIに入力
@@ -619,6 +705,14 @@ try:
                 elif is_in_rect(mouse_x, mouse_y, 320, 385, 260, 40):
                     auto_player.scan_songs()
 
+                # 指の狭さ（ピンチ判定しきい値）調整ボタン (最下段)
+                elif is_in_rect(mouse_x, mouse_y, 320, 435, 120, 38):
+                    PINCH_THRESHOLD = round(max(0.20, PINCH_THRESHOLD - 0.05), 2)
+                    print(f"【設定変更】ピンチ判定しきい値: {PINCH_THRESHOLD:.2f}")
+                elif is_in_rect(mouse_x, mouse_y, 460, 435, 120, 38):
+                    PINCH_THRESHOLD = round(min(0.95, PINCH_THRESHOLD + 0.05), 2)
+                    print(f"【設定変更】ピンチ判定しきい値: {PINCH_THRESHOLD:.2f}")
+
 
         # ------------------------------------
         # MIDIコントローラーからの入力をVitalへスルー転送
@@ -638,8 +732,12 @@ try:
                 state['active'] = True
 
                 features = extract_hand_features(hand_landmarks)
-                y = features['index_y']
-                y = max(Y_MIN_LIMIT, min(Y_MAX_LIMIT, y))
+                state['pinch'] = features['pinch']
+
+                raw_y = features['index_y']
+                in_play_zone = (Y_MIN_LIMIT <= raw_y <= Y_MAX_LIMIT)
+
+                y = max(Y_MIN_LIMIT, min(Y_MAX_LIMIT, raw_y))
                 y_scaled = (y - Y_MIN_LIMIT) / (Y_MAX_LIMIT - Y_MIN_LIMIT)
 
                 # 指の震え（チャタリング）を抑えるための指数移動平均（EMA）フィルター
@@ -665,7 +763,8 @@ try:
                 if hand_type == 'Left':
                     note = max(0, note - 12)
 
-                cc_value = int(features['pinch'] * 127)
+                # 演奏境界線外では音量をゼロにして余韻・誤発音をカット
+                cc_value = int(features['pinch'] * 127) if in_play_zone else 0
                 cc_value = max(0, min(127, cc_value))
 
                 x_cc_value = int(features['index_x'] * 127)
@@ -677,8 +776,8 @@ try:
                 if WAVE_MODE:
                     outport.send(mido.Message('control_change', control=16, value=x_cc_value, channel=state['channel']))
 
-                # つまんでいるかどうかの判定
-                is_pinching = features['pinch'] >= PINCH_THRESHOLD
+                # つまみ判定かつ演奏境界線内のときのみ発音有効（端の外では一切反応させない）
+                is_pinching = (features['pinch'] >= PINCH_THRESHOLD) and in_play_zone
 
                 if STRUM_MODE:
                     # ------------------------------------
@@ -879,10 +978,16 @@ try:
                 name_color = (255, 255, 255) if RAINBOW_LANES else (110, 110, 110)
                 cv2.putText(image, note_name, (15, y_center_px + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, name_color, 1)
 
-            # 自動演奏曲ステータス表示
-            cur_song_title = auto_player.get_current_title()
-            # レーンの音名(x=15)と重ならないよう少し右から描画し、背景帯を敷く
-            put_text_jp(image, f"AutoSong: {cur_song_title}  [N:Next / P:Prev / S:Scan]", (50, 103), 15, (0, 255, 255), bg_color=(30, 30, 30))
+            # 演奏境界線（上端・下端の境界を常に可視化して、線の外で反応しないエリアを明示）
+            bound_color = (0, 0, 255) if SHOW_DEBUG else (70, 70, 120)
+            bound_thick = 2 if SHOW_DEBUG else 1
+            cv2.line(image, (0, int(h * Y_MIN_LIMIT)), (w, int(h * Y_MIN_LIMIT)), bound_color, bound_thick)
+            cv2.line(image, (0, int(h * Y_MAX_LIMIT)), (w, int(h * Y_MAX_LIMIT)), bound_color, bound_thick)
+
+            # 自動演奏曲ステータス表示（曲変更後3.5秒間のみトースト表示し、演奏画面に文字が残り続けないようにする）
+            if time.time() - auto_player.title_changed_at < 3.5:
+                cur_song_title = auto_player.get_current_title()
+                put_text_jp(image, f"AutoSong: {cur_song_title}  [N:Next / P:Prev / S:Scan]", (50, 103), 15, (0, 255, 255), bg_color=(30, 30, 30))
 
             # 右上にSettingsボタンを描画
             draw_button(image, "Settings [Tab]", w - 140, 10, 130, 35, False, active_color=(0, 255, 0))
@@ -891,15 +996,11 @@ try:
             # デバッグ表示（SHOW_DEBUG が True のときのみ）
             # ------------------------------------
             if SHOW_DEBUG:
-                # 有効演奏エリアの最上部・最下部の境界線
-                cv2.line(image, (0, int(h * Y_MIN_LIMIT)), (w, int(h * Y_MIN_LIMIT)), (0, 0, 255), 2)
-                cv2.line(image, (0, int(h * Y_MAX_LIMIT)), (w, int(h * Y_MAX_LIMIT)), (0, 0, 255), 2)
-
                 # 左上に1行でステータスを集約表示
                 wave_txt = "WAVE:ON" if WAVE_MODE else "WAVE:OFF"
                 strum_txt = "STRUM:ON" if STRUM_MODE else "STRUM:OFF"
                 auto_txt = "AUTO:ON" if AUTO_PLAY_ENABLED else "AUTO:OFF"
-                status_line = f"[{CURRENT_KEY}] | {wave_txt} | {strum_txt} | {auto_txt}"
+                status_line = f"[{CURRENT_KEY}] | {wave_txt} | {strum_txt} | {auto_txt} | TH:{PINCH_THRESHOLD:.2f}"
                 cv2.putText(image, status_line, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
 
                 r_note = hand_states['Right']['note']
@@ -947,6 +1048,13 @@ try:
             draw_button(image, "< Prev [P]", 40, 385, 120, 40, False, active_color=(0, 255, 255))
             draw_button(image, "Next [N] >", 180, 385, 120, 40, False, active_color=(0, 255, 255))
             draw_button(image, "Rescan songs/ [S]", 320, 385, 260, 40, False, active_color=(0, 200, 255))
+
+            # 指の狭さ（ピンチ判定しきい値）コントロール (最下段)
+            r_p = int(hand_states['Right'].get('pinch', 0.0) * 100)
+            l_p = int(hand_states['Left'].get('pinch', 0.0) * 100)
+            put_text_jp(image, f"Pinch Threshold: {PINCH_THRESHOLD:.2f} (Now R:{r_p}% L:{l_p}%)", (40, 442), 15, (255, 255, 255))
+            draw_button(image, "[-] Down", 320, 435, 120, 38, False, active_color=(255, 200, 0))
+            draw_button(image, "[+] Up", 460, 435, 120, 38, False, active_color=(255, 200, 0))
 
         # ------------------------------------
         # 手の描画処理（演奏画面のときのみ表示）
@@ -1002,11 +1110,8 @@ try:
                     else:
                         cv2.circle(image, (idx_x, idx_y), 14, (255, 255, 255), 2)
 
-        if FULLSCREEN:
-            cv2.imshow('Theremin Camera', letterbox_to_screen(image, SCREEN_SIZE))
-        else:
-            display_offset_x, display_offset_y = 0, 0
-            cv2.imshow('Theremin Camera', image)
+        # 映像を表示（黒帯なしでウィンドウ・全画面に完全追従）
+        cv2.imshow('Theremin Camera', image)
 
         key = cv2.waitKey(5)
         if key != -1:
@@ -1042,6 +1147,7 @@ try:
                 print(f"【切替】和音モードが {'ON' if STRUM_MODE else 'OFF'} になりました")
             elif key == ord('m'):
                 AUTO_PLAY_ENABLED = not AUTO_PLAY_ENABLED
+                auto_player.title_changed_at = time.time()
                 print(f"【切替】自動演奏機能が {'ON' if AUTO_PLAY_ENABLED else 'OFF'} になりました")
                 if not AUTO_PLAY_ENABLED:
                     auto_player.pause()
@@ -1057,6 +1163,14 @@ try:
                 auto_player.prev_song()
             elif key == ord('s'):
                 auto_player.scan_songs()
+            elif key == ord('-') or key == ord('_'):
+                PINCH_THRESHOLD = round(max(0.20, PINCH_THRESHOLD - 0.05), 2)
+                auto_player.title_changed_at = time.time()
+                print(f"【設定変更】ピンチ判定しきい値: {PINCH_THRESHOLD:.2f}")
+            elif key == ord('=') or key == ord('+'):
+                PINCH_THRESHOLD = round(min(0.95, PINCH_THRESHOLD + 0.05), 2)
+                auto_player.title_changed_at = time.time()
+                print(f"【設定変更】ピンチ判定しきい値: {PINCH_THRESHOLD:.2f}")
             elif key == ord('f'):
                 FULLSCREEN = not FULLSCREEN
                 apply_window_mode('Theremin Camera', FULLSCREEN)
