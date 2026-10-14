@@ -21,7 +21,6 @@ import threading
 import time
 import os
 import glob
-import song_fetcher
 
 # =======
 # 和音や音階リストを定義する配列
@@ -265,81 +264,14 @@ def extract_hand_features(hand_landmarks):
     return features
 
 # ==========================================
-# 自動演奏用メロディデータ & クラス
+# 自動演奏用クラス (MIDIインポート再生専用)
 # ==========================================
-
-# 1. YMO「ライディーン」
-RYDEEN_MELODY = [
-    (67, 0.2), (67, 0.2), (69, 0.2), (71, 0.2), (74, 0.4), (71, 0.4),
-    (69, 0.2), (67, 0.2), (69, 0.2), (71, 0.2), (67, 0.6), (0, 0.2),
-    (67, 0.2), (67, 0.2), (69, 0.2), (71, 0.2), (74, 0.4), (76, 0.4),
-    (79, 0.2), (76, 0.2), (74, 0.2), (71, 0.2), (74, 0.6), (0, 0.4)
-]
-
-# 2. 黒うさP / 初音ミク「千本桜」サビ
-SENBONZAKURA_MELODY = [
-    (69, 0.18), (69, 0.18), (69, 0.18), (72, 0.25), (69, 0.18), (67, 0.25),
-    (69, 0.18), (69, 0.18), (69, 0.18), (72, 0.25), (74, 0.35), (0, 0.15),
-    (72, 0.18), (74, 0.18), (76, 0.25), (76, 0.25), (74, 0.25),
-    (72, 0.18), (69, 0.18), (67, 0.25), (69, 0.45), (0, 0.3),
-    (69, 0.18), (69, 0.18), (69, 0.18), (72, 0.25), (69, 0.18), (67, 0.25),
-    (69, 0.18), (69, 0.18), (69, 0.18), (72, 0.25), (74, 0.35), (0, 0.15),
-    (72, 0.18), (74, 0.18), (76, 0.25), (76, 0.25), (74, 0.25),
-    (72, 0.18), (69, 0.18), (67, 0.25), (69, 0.5), (0, 0.4)
-]
-
-# 3. 高橋洋子「残酷な天使のテーゼ」サビ
-ZANKOKU_MELODY = [
-    (72, 0.3), (75, 0.2), (77, 0.3), (75, 0.2), (74, 0.25), (72, 0.4), (0, 0.15),
-    (74, 0.2), (74, 0.2), (75, 0.2), (77, 0.25), (79, 0.35), (77, 0.2), (75, 0.2), (74, 0.4), (0, 0.2),
-    (72, 0.25), (75, 0.25), (77, 0.25), (79, 0.45), (0, 0.15),
-    (82, 0.3), (80, 0.2), (79, 0.25), (77, 0.25), (79, 0.35), (75, 0.25), (72, 0.6), (0, 0.5)
-]
-
-# 4. 東方幻想郷「Bad Apple!!」サビ
-BAD_APPLE_MELODY = [
-    (71, 0.2), (71, 0.2), (71, 0.2), (71, 0.2), (72, 0.2), (71, 0.2), (69, 0.2), (67, 0.2),
-    (69, 0.2), (69, 0.2), (69, 0.2), (69, 0.2), (71, 0.2), (69, 0.2), (67, 0.2), (66, 0.2),
-    (67, 0.2), (67, 0.2), (67, 0.2), (67, 0.2), (69, 0.2), (67, 0.2), (66, 0.2), (64, 0.2),
-    (66, 0.2), (67, 0.2), (69, 0.2), (71, 0.3), (69, 0.2), (67, 0.2), (66, 0.3), (0, 0.4)
-]
-
-# 5. 東方紅魔郷「U.N.オーエンは彼女なのか？」メインフレーズ
-UN_OWEN_MELODY = [
-    (71, 0.15), (76, 0.15), (71, 0.15), (76, 0.15), (75, 0.15), (76, 0.15), (78, 0.15), (76, 0.15),
-    (71, 0.15), (76, 0.15), (71, 0.15), (76, 0.15), (75, 0.15), (76, 0.15), (78, 0.15), (76, 0.15),
-    (79, 0.15), (78, 0.15), (76, 0.15), (75, 0.15), (76, 0.15), (78, 0.15), (75, 0.15), (71, 0.25), (0, 0.1),
-    (71, 0.15), (76, 0.15), (71, 0.15), (76, 0.15), (75, 0.15), (76, 0.15), (78, 0.15), (76, 0.15),
-    (71, 0.15), (76, 0.15), (71, 0.15), (76, 0.15), (75, 0.15), (76, 0.15), (78, 0.15), (76, 0.15),
-    (79, 0.15), (78, 0.15), (76, 0.15), (75, 0.15), (76, 0.15), (78, 0.15), (79, 0.2), (81, 0.35), (0, 0.4)
-]
-
-# 6. J.パッヘルベル「カノン」D Major (Andante ♩=84 楽譜準拠)
-CANON_MELODY = [
-    # 序奏和音（D - A - Bm - F#m - G - D - G - A）
-    (74, 0.71), (73, 0.71), (71, 0.71), (69, 0.71), (67, 0.71), (66, 0.71), (67, 0.71), (69, 0.71),
-    # 第1主題（四分音符の優美な主旋律）
-    (78, 0.71), (76, 0.71), (74, 0.71), (73, 0.71),
-    (71, 0.71), (69, 0.71), (71, 0.71), (73, 0.71),
-    (74, 0.71), (73, 0.71), (71, 0.71), (69, 0.71),
-    (67, 0.71), (66, 0.71), (67, 0.71), (64, 0.71),
-    # 小節13〜16
-    (66, 0.71), (69, 0.71), (67, 0.71), (66, 0.71),
-    (64, 0.71), (62, 0.71), (64, 0.71), (66, 0.71),
-    (67, 0.71), (71, 0.71), (69, 0.71), (67, 0.71),
-    (66, 0.71), (64, 0.71), (66, 0.71), (67, 0.71),
-    # 第2主題（八分音符の流れる旋律）
-    (78, 0.36), (74, 0.36), (76, 0.36), (73, 0.36), (74, 0.36), (71, 0.36), (73, 0.36), (69, 0.36),
-    (71, 0.36), (67, 0.36), (69, 0.36), (66, 0.36), (67, 0.36), (64, 0.36), (66, 0.36), (62, 0.36),
-    (74, 0.36), (71, 0.36), (73, 0.36), (69, 0.36), (71, 0.36), (67, 0.36), (69, 0.36), (66, 0.36),
-    (67, 0.36), (64, 0.36), (66, 0.36), (62, 0.36), (64, 0.36), (61, 0.36), (62, 0.36), (64, 0.36),
-    (74, 1.43), (0, 0.5)
-]
-
+MIDI_DIR = "songs"
 
 class AutoPlayer:
-    def __init__(self, outport):
+    def __init__(self, outport, midi_dir=MIDI_DIR):
         self.outport = outport
+        self.midi_dir = midi_dir
         self.running = False
         self.paused = True
         self.thread = None
@@ -347,95 +279,104 @@ class AutoPlayer:
         self.current_idx = 0
         self.song_changed = False
         self.songs = []
-        self._init_song_catalog()
+        self._last_scan_files = []
 
-    def _init_song_catalog(self):
-        """演奏可能な楽曲リスト（プリセット＋ローカルMIDI＋オンラインカタログ）を構築"""
-        self.songs = [
-            {"type": "preset", "title": "カノン (パッヘルベル)", "data": CANON_MELODY},
-            {"type": "preset", "title": "ライディーン (YMO)", "data": RYDEEN_MELODY},
-            {"type": "preset", "title": "千本桜 (初音ミク)", "data": SENBONZAKURA_MELODY},
-            {"type": "preset", "title": "残酷な天使のテーゼ (エヴァ)", "data": ZANKOKU_MELODY},
-            {"type": "preset", "title": "Bad Apple!! (東方)", "data": BAD_APPLE_MELODY},
-            {"type": "preset", "title": "U.N.オーエンは彼女なのか？ (東方)", "data": UN_OWEN_MELODY},
-        ]
-        
-        # 0. 楽譜から生成されたカノン（最優先曲）
-        canon_path = os.path.join("songs", "canon.mid")
-        if os.path.exists(canon_path):
-            self.songs.insert(0, {"type": "midi", "title": "カノン (パッヘルベル) [Full MIDI]", "path": canon_path})
+        # songs フォルダがなければ自動作成
+        if not os.path.exists(self.midi_dir):
+            os.makedirs(self.midi_dir, exist_ok=True)
 
-        # 1. カレントディレクトリの rydeen.mid があれば登録
-        if os.path.exists("rydeen.mid"):
-            self.songs.append({"type": "midi", "title": "ライディーン (Full MIDI)", "path": "rydeen.mid"})
+        self.scan_songs()
 
-        # 2. songs/ または downloaded_songs/ フォルダ内のMIDIファイルを追加
-        for search_dir in ["songs", "downloaded_songs"]:
-            if os.path.exists(search_dir):
-                for f in glob.glob(os.path.join(search_dir, "*.mid")):
-                    fname = os.path.basename(f)
-                    if fname == "canon.mid":
-                        continue  # 既に0番目に最優先登録済み
-                    title = f"{os.path.splitext(fname)[0]} [MIDI]"
-                    self.songs.append({"type": "midi", "title": title, "path": f})
-
-        # 3. song_fetcher のオンライン人気曲（未キャッシュのものもリストに登録）
-        for item in song_fetcher.FEATURED_ONLINE_SONGS:
-            cached_path = song_fetcher.get_cached_path(item["local_filename"])
-            if os.path.exists(cached_path):
-                already = any(s.get("path") == cached_path for s in self.songs)
-                if not already:
-                    self.songs.append({"type": "midi", "title": f"{item['title']} [DL済]", "path": cached_path})
-            else:
-                self.songs.append({"type": "online", "title": f"{item['title']} [API取得]", "raw_info": item})
-
-    def reload_songs(self):
-        """外部追加などがあった場合にリストを再読み込み"""
+    def scan_songs(self):
+        """songs/ フォルダおよびカレント内のMIDIファイルをスキャンして自動登録・更新"""
         with self.lock:
-            current_title = self.get_current_title()
-            self._init_song_catalog()
+            midi_files = []
+            seen_paths = set()
+
+            def add_file(f):
+                norm = os.path.normcase(os.path.abspath(f))
+                if norm not in seen_paths and os.path.isfile(f):
+                    seen_paths.add(norm)
+                    midi_files.append(f)
+
+            # 1. songs/ フォルダ内のMIDIファイルを収集
+            if os.path.exists(self.midi_dir):
+                for ext in ["*.mid", "*.midi", "*.MID", "*.MIDI"]:
+                    for f in glob.glob(os.path.join(self.midi_dir, ext)):
+                        add_file(f)
+
+            # 2. カレントディレクトリのMIDIファイルも収集
+            for ext in ["*.mid", "*.midi", "*.MID", "*.MIDI"]:
+                for f in glob.glob(ext):
+                    add_file(f)
+
+            # ファイル名順（canonがあれば最優先）でソート
+            def sort_key(f):
+                base = os.path.basename(f).lower()
+                return (0 if "canon" in base else 1, base)
+
+            midi_files.sort(key=sort_key)
+
+            # ファイル構成に変化がなければスキップ
+            current_file_keys = [os.path.normcase(os.path.abspath(f)) for f in midi_files]
+            if current_file_keys == self._last_scan_files and self.songs:
+                return False
+
+            self._last_scan_files = list(current_file_keys)
+
+            current_norm = os.path.normcase(os.path.abspath(self.songs[self.current_idx]["path"])) if (self.songs and self.current_idx < len(self.songs)) else None
+
+            new_songs = []
+            for f in midi_files:
+                fname = os.path.basename(f)
+                title = os.path.splitext(fname)[0]
+                new_songs.append({
+                    "title": title,
+                    "path": f
+                })
+
+            self.songs = new_songs
+
+            # 以前選択していた曲の位置を維持
             found = False
-            for i, s in enumerate(self.songs):
-                if s["title"] == current_title:
-                    self.current_idx = i
-                    found = True
-                    break
-            if not found and self.current_idx >= len(self.songs):
+            if current_norm:
+                for i, s in enumerate(self.songs):
+                    if os.path.normcase(os.path.abspath(s["path"])) == current_norm:
+                        self.current_idx = i
+                        found = True
+                        break
+            if not found:
                 self.current_idx = 0
 
+            if self.songs:
+                print(f"【MIDIカタログ更新】{len(self.songs)}曲のMIDIファイルを認識しました。")
+            return True
+
     def next_song(self):
+        self.scan_songs()  # 切り替え時に最新フォルダ状況を反映
         with self.lock:
             if not self.songs:
                 return
             self.current_idx = (self.current_idx + 1) % len(self.songs)
             self.song_changed = True
             self._all_notes_off()
-            print(f"【自動演奏】次の曲へ切替: {self.get_current_title()} [{self.current_idx + 1}/{len(self.songs)}]")
+            print(f"【自動演奏】次のMIDIへ切替: {self.get_current_title()}")
 
     def prev_song(self):
+        self.scan_songs()  # 切り替え時に最新フォルダ状況を反映
         with self.lock:
             if not self.songs:
                 return
             self.current_idx = (self.current_idx - 1) % len(self.songs)
             self.song_changed = True
             self._all_notes_off()
-            print(f"【自動演奏】前の曲へ切替: {self.get_current_title()} [{self.current_idx + 1}/{len(self.songs)}]")
+            print(f"【自動演奏】前のMIDIへ切替: {self.get_current_title()}")
 
     def get_current_title(self):
-        if not self.songs:
-            return "No Songs"
-        return self.songs[self.current_idx]["title"]
-
-    def fetch_all_featured_online(self):
-        """オンラインの東方Project曲を一括ダウンロードしてリストを即座に最新化"""
-        print("【自動演奏】東方Project名曲MIDIの一括ダウンロードを開始します...")
-        def _bg():
-            for item in song_fetcher.FEATURED_ONLINE_SONGS:
-                song_fetcher.download_song(item)
-            self.reload_songs()
-            print("【自動演奏】東方Project名曲MIDIのダウンロードと登録が完了しました！")
-        t = threading.Thread(target=_bg, daemon=True)
-        t.start()
+        with self.lock:
+            if not self.songs:
+                return "No MIDI files in 'songs/'"
+            return f"{self.songs[self.current_idx]['title']} [{self.current_idx + 1}/{len(self.songs)}]"
 
     def start(self):
         self.running = True
@@ -454,6 +395,7 @@ class AutoPlayer:
                 print("【自動演奏】一時停止（人が検知されました）")
 
     def resume(self):
+        self.scan_songs()  # 再開前にも最新の追加MIDIを自動反映
         with self.lock:
             if self.paused:
                 self.paused = False
@@ -466,78 +408,41 @@ class AutoPlayer:
             self.thread.join()
 
     def _play_loop(self):
-
+        last_check_time = 0
         while self.running:
-            if not self.songs:
-                time.sleep(0.5)
-                continue
+            # 3秒おきにディレクトリを自動スキャンして新規追加MIDIを動的検知
+            now = time.time()
+            if now - last_check_time > 3.0:
+                self.scan_songs()
+                last_check_time = now
 
             with self.lock:
+                if not self.songs:
+                    time.sleep(0.5)
+                    continue
                 idx = self.current_idx
                 song = self.songs[idx]
                 self.song_changed = False
 
-            # 未ダウンロードのオンライン曲の場合は、自動で即時取得
-            if song["type"] == "online":
-                print(f"【自動演奏】オンライン曲をダウンロード中...: {song['title']}")
-                path = song_fetcher.download_song(song["raw_info"])
-                if path:
-                    song["type"] = "midi"
-                    song["path"] = path
-                    song["title"] = f"{song['raw_info']['title']} [DL済]"
-                else:
-                    time.sleep(1)
-                    continue
-
-            # 1. MIDIファイルの再生
-            if song["type"] == "midi":
-                mid_path = song.get("path")
-                if os.path.exists(mid_path):
-                    try:
-                        mid = mido.MidiFile(mid_path)
-                        print(f"【自動演奏】MIDI再生中: {song['title']}")
-                        for msg in mid.play():
-                            if not self.running or self.song_changed:
-                                break
-                            while self.paused and self.running and not self.song_changed:
-                                time.sleep(0.1)
-                            if self.song_changed:
-                                break
-                            if not self.paused:
-                                self.outport.send(msg)
-                    except Exception as e:
-                        print(f"MIDI再生エラー ({song['title']}): {e}")
-                        time.sleep(1)
-                else:
-                    time.sleep(0.5)
-
-            # 2. 簡易メロディ（プリセット）の再生
-            elif song["type"] == "preset":
-                melody = song["data"]
-                for note, duration in melody:
-                    if not self.running or self.song_changed:
-                        break
-
-                    while self.paused and self.running and not self.song_changed:
-                        time.sleep(0.1)
-
-                    if self.song_changed:
-                        break
-
-                    if note > 0 and not self.paused:
-                        # チャンネル3 (channel=2) を自動演奏で使用
-                        self.outport.send(mido.Message('note_on', note=note, velocity=75, channel=2))
-
-                    steps = max(1, int(duration / 0.05))
-                    for _ in range(steps):
-                        if not self.running or self.paused or self.song_changed:
+            mid_path = song.get("path")
+            if os.path.exists(mid_path):
+                try:
+                    mid = mido.MidiFile(mid_path)
+                    print(f"【自動演奏】MIDI再生中: {song['title']}")
+                    for msg in mid.play():
+                        if not self.running or self.song_changed:
                             break
-                        time.sleep(0.05)
-
-                    if note > 0:
-                        self.outport.send(mido.Message('note_off', note=note, channel=2))
-
-                    time.sleep(0.02)
+                        while self.paused and self.running and not self.song_changed:
+                            time.sleep(0.1)
+                        if self.song_changed:
+                            break
+                        if not self.paused:
+                            self.outport.send(msg)
+                except Exception as e:
+                    print(f"MIDI再生エラー ({song['title']}): {e}")
+                    time.sleep(1)
+            else:
+                time.sleep(0.5)
 
             self._all_notes_off()
             time.sleep(0.3)
@@ -706,13 +611,13 @@ try:
                     RAINBOW_LANES = not RAINBOW_LANES
                     print(f"【切替】虹色レーンが {'ON' if RAINBOW_LANES else 'OFF'} になりました")
 
-                # 自動演奏曲選択 & API取得ボタン（下段）
+                # 自動演奏曲選択 & ディレクトリ再スキャンボタン（下段）
                 elif is_in_rect(mouse_x, mouse_y, 40, 385, 120, 40):
                     auto_player.prev_song()
                 elif is_in_rect(mouse_x, mouse_y, 180, 385, 120, 40):
                     auto_player.next_song()
                 elif is_in_rect(mouse_x, mouse_y, 320, 385, 260, 40):
-                    auto_player.fetch_all_featured_online()
+                    auto_player.scan_songs()
 
 
         # ------------------------------------
@@ -977,7 +882,7 @@ try:
             # 自動演奏曲ステータス表示
             cur_song_title = auto_player.get_current_title()
             # レーンの音名(x=15)と重ならないよう少し右から描画し、背景帯を敷く
-            put_text_jp(image, f"AutoSong: {cur_song_title}  [N:Next / P:Prev / T:Fetch]", (50, 103), 15, (0, 255, 255), bg_color=(30, 30, 30))
+            put_text_jp(image, f"AutoSong: {cur_song_title}  [N:Next / P:Prev / S:Scan]", (50, 103), 15, (0, 255, 255), bg_color=(30, 30, 30))
 
             # 右上にSettingsボタンを描画
             draw_button(image, "Settings [Tab]", w - 140, 10, 130, 35, False, active_color=(0, 255, 0))
@@ -1041,7 +946,7 @@ try:
             put_text_jp(image, f"AutoSong: {cur_song_title}", (40, 358), 16, (255, 255, 255))
             draw_button(image, "< Prev [P]", 40, 385, 120, 40, False, active_color=(0, 255, 255))
             draw_button(image, "Next [N] >", 180, 385, 120, 40, False, active_color=(0, 255, 255))
-            draw_button(image, "Fetch Touhou [T]", 320, 385, 260, 40, False, active_color=(255, 200, 0))
+            draw_button(image, "Rescan songs/ [S]", 320, 385, 260, 40, False, active_color=(0, 200, 255))
 
         # ------------------------------------
         # 手の描画処理（演奏画面のときのみ表示）
@@ -1150,8 +1055,8 @@ try:
                 auto_player.next_song()
             elif key == ord('p') or key == ord(']'):
                 auto_player.prev_song()
-            elif key == ord('t'):
-                auto_player.fetch_all_featured_online()
+            elif key == ord('s'):
+                auto_player.scan_songs()
             elif key == ord('f'):
                 FULLSCREEN = not FULLSCREEN
                 apply_window_mode('Theremin Camera', FULLSCREEN)
