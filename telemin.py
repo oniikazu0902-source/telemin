@@ -8,6 +8,16 @@
 #   4. トースト表示: 演奏画面では曲切り替え時のみ数秒間表示し、通常演奏画面をクリアに維持。
 #   5. ピンチしきい値調整: キーボード [-] / [+] や設定画面(Tab)から直感的に感度調整可能。
 #   6. 日本語表示: put_text_jp() によりPillow+Windows標準フォントで文字化けなく描画。
+#
+# Gemini へ（Claude より 2026-10-15）:
+#   AUTO を ON にすると画面がフリーズする不具合を修正しました。
+#   原因は AutoPlayer のデッドロックです。resume() / next_song() / prev_song() や
+#   曲の自動進行で、self.lock を握ったまま get_current_title()（これも self.lock を取る）
+#   を呼んでおり、通常の threading.Lock は同じスレッドから2回取れないため永久に待っていました。
+#   → self.lock を threading.RLock() に変更。lock の中から lock を取るメソッドを呼ぶ
+#     書き方は今後も RLock 前提なので、Lock に戻さないでください。
+#   あわせて、resume() は毎フレーム呼ばれるので停止中のときだけ scan_songs() するようにし、
+#   _play_loop() で lock を握ったまま sleep していた箇所を外に出しました。
 # ------------------------------------------------------------------
 import cv2
 import numpy as np
@@ -271,7 +281,9 @@ class AutoPlayer:
         self.running = False
         self.paused = True
         self.thread = None
-        self.lock = threading.Lock()
+        # RLock（再入可能ロック）にすること。lock を握ったまま get_current_title() など
+        # lock を取るメソッドを呼ぶ箇所があり、通常の Lock だとデッドロックして画面がフリーズする
+        self.lock = threading.RLock()
         self.current_idx = 0
         self.song_changed = False
         self.songs = []
@@ -395,6 +407,9 @@ class AutoPlayer:
                 print("【自動演奏】一時停止（人が検知されました）")
 
     def resume(self):
+        # メインループから毎フレーム呼ばれるため、停止中→再開のときだけフォルダをスキャンする
+        if not self.paused:
+            return
         self.scan_songs()  # 再開前にも最新の追加MIDIを自動反映
         with self.lock:
             if self.paused:
@@ -421,8 +436,14 @@ class AutoPlayer:
                 last_check_time = now
 
             with self.lock:
+                has_songs = bool(self.songs)
+            if not has_songs:
+                # lock を握ったまま sleep するとメインスレッドが待たされるので外で待つ
+                time.sleep(0.5)
+                continue
+
+            with self.lock:
                 if not self.songs:
-                    time.sleep(0.5)
                     continue
                 idx = self.current_idx
                 song = self.songs[idx]
