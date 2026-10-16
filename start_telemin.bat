@@ -1,4 +1,6 @@
 @echo off
+:: Move to this script's folder so it works from shortcuts / other directories
+cd /d "%~dp0"
 echo ==========================================
 echo  tElemin Launcher
 echo ==========================================

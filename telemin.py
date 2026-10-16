@@ -18,6 +18,20 @@
 #     書き方は今後も RLock 前提なので、Lock に戻さないでください。
 #   あわせて、resume() は毎フレーム呼ばれるので停止中のときだけ scan_songs() するようにし、
 #   _play_loop() で lock を握ったまま sleep していた箇所を外に出しました。
+#
+# Gemini へ（Claude より 2026-10-17）:
+#   連弾対応（最大4本の手）と細かな不具合修正をしました。
+#   1. hand_states を {'Right':..., 'Left':...} の辞書から「スロットのリスト」に変更。
+#      MAX_HANDS（既定4）本まで認識し、スロット i は MIDI チャンネル i を使います。
+#      MediaPipe は手に ID を振らないので、assign_hands_to_slots() で前フレームの
+#      手のひら位置に近いスロットへ割り当てて追跡しています。左右判定は state['label'] に
+#      入っており、左手1オクターブ下げは従来どおりです。手を消すときは release_hand() を使ってください。
+#      → 両手が同じ 'Right' と判定されて1つの状態を奪い合い、音がブツブツ切れる不具合もこれで解消。
+#   2. 設定画面の WAVE/STRUM/AUTO ボタンのクリック判定が描画より10px下にずれていたのを修正。
+#   3. AutoPlayer の note_on 送信を self.lock 内で paused を再確認してから行うように変更
+#      （pause() の全消音直後に1音すべり込んで鳴りっぱなしになるのを防止）。
+#   4. ×ボタンでウィンドウを閉じたら終了するように変更。
+#   5. スクリプトの場所へ os.chdir するようにし、bat にも cd /d "%~dp0" を追加。
 # ------------------------------------------------------------------
 import cv2
 import numpy as np
@@ -31,6 +45,9 @@ import threading
 import time
 import os
 import glob
+
+# どこから起動しても hand_landmarker.task や songs/ を見つけられるよう、スクリプトの場所を基準にする
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 # =======
 # 和音や音階リストを定義する配列
@@ -66,6 +83,12 @@ SCALE_MENU_ITEMS = [
 Y_MIN_LIMIT = 0.15  # これより上（0.0〜0.15）は無視
 Y_MAX_LIMIT = 0.85  # これより下（0.85〜1.0）は無視
 PINCH_THRESHOLD = 0.70  # つまみ判定のしきい値（0.20〜0.95、キーボード[-] / [+]や設定画面で調整可能）
+
+# 同時に認識する手の最大数（4 = 2人で連弾）。手ごとに MIDI チャンネル 1, 2, 3, 4 ... を割り当てる
+# 増やすほど MediaPipe の処理が重くなるので、カクつく場合は 2 に戻すこと
+MAX_HANDS = 4
+# 前フレームの手と同一とみなす最大移動距離（画面幅を1.0とした割合）
+HAND_TRACK_MAX_DIST = 0.25
 
 # 波形変化モードのデフォルト状態
 WAVE_MODE = False
@@ -497,21 +520,27 @@ class AutoPlayer:
                         # 2. note_on / note_off のみ厳選送信（外部MIDIのCCやプログラムチェンジによるシンセ誤動作を防止）
                         if msg.type == 'note_on' and msg.velocity > 0:
                             key = (msg.channel, msg.note)
-                            # 同音連打時は先に消音
-                            if key in active_notes:
-                                self.outport.send(mido.Message('note_off', note=msg.note, channel=msg.channel))
-                                del active_notes[key]
+                            # pause() と同じ lock を取り、一時停止状態を再確認してから鳴らす。
+                            # lock なしだと pause() の全消音の直後に1音すべり込み、鳴りっぱなしになる
+                            with self.lock:
+                                if self.paused:
+                                    continue
 
-                            # ポリフォニー上限チェック（音が濁るのを防ぐため最も古い音を消音）
-                            if len(active_notes) >= MAX_POLYPHONY:
-                                oldest_key = min(active_notes, key=active_notes.get)
-                                self.outport.send(mido.Message('note_off', note=oldest_key[1], channel=oldest_key[0]))
-                                del active_notes[oldest_key]
+                                # 同音連打時は先に消音
+                                if key in active_notes:
+                                    self.outport.send(mido.Message('note_off', note=msg.note, channel=msg.channel))
+                                    del active_notes[key]
 
-                            # ベロシティを適切な音量帯(55〜110)にノーマライズ
-                            vel = max(55, min(110, msg.velocity))
-                            self.outport.send(mido.Message('note_on', note=msg.note, velocity=vel, channel=msg.channel))
-                            active_notes[key] = time.time()
+                                # ポリフォニー上限チェック（音が濁るのを防ぐため最も古い音を消音）
+                                if len(active_notes) >= MAX_POLYPHONY:
+                                    oldest_key = min(active_notes, key=active_notes.get)
+                                    self.outport.send(mido.Message('note_off', note=oldest_key[1], channel=oldest_key[0]))
+                                    del active_notes[oldest_key]
+
+                                # ベロシティを適切な音量帯(55〜110)にノーマライズ
+                                vel = max(55, min(110, msg.velocity))
+                                self.outport.send(mido.Message('note_on', note=msg.note, velocity=vel, channel=msg.channel))
+                                active_notes[key] = time.time()
 
                         elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
                             key = (msg.channel, msg.note)
@@ -541,7 +570,7 @@ class AutoPlayer:
 base_options = python.BaseOptions(model_asset_path='hand_landmarker.task')
 options = vision.HandLandmarkerOptions(
     base_options=base_options,
-    num_hands=2,  # 検出する手の数
+    num_hands=MAX_HANDS,  # 検出する手の数
     min_hand_detection_confidence=0.7
 )
 detector = vision.HandLandmarker.create_from_options(options)
@@ -599,28 +628,70 @@ cv2.setMouseCallback('Theremin Camera', on_mouse)
 SCREEN_SIZE = get_screen_size()
 apply_window_mode('Theremin Camera', FULLSCREEN)
 
-hand_states = {
-    'Right': {
+# 手の状態は「左右」ではなく「スロット（手の番号）」で管理する。
+# MediaPipe は両手を同じ 'Right' と判定することがあり、左右で管理すると1つの状態を
+# 2本の手が奪い合って音がブツブツ切れるため。スロット i は MIDI チャンネル i を使う。
+def new_hand_state(channel):
+    return {
         'note': None,
         'notes': set(),
         'pinch_start_x': None,
         'pinch_start_y': None,
         'y_smooth': None,
-        'channel': 0,
+        'channel': channel,
         'active': False,
-        'pinch': 0.0
-    },
-    'Left': {
-        'note': None,
-        'notes': set(),
-        'pinch_start_x': None,
-        'pinch_start_y': None,
-        'y_smooth': None,
-        'channel': 1,
-        'active': False,
-        'pinch': 0.0
+        'pinch': 0.0,
+        'label': 'Right',  # MediaPipe の左右判定（左手は1オクターブ下げるのに使う）
+        'pos': None        # 前フレームの手のひら中心（スロット追跡用）
     }
-}
+
+hand_states = [new_hand_state(i) for i in range(MAX_HANDS)]
+
+def release_hand(state):
+    """手が消えたスロットの音を止めて状態を初期化する"""
+    if state['note'] is not None:
+        outport.send(mido.Message('note_off', note=state['note'], channel=state['channel']))
+        state['note'] = None
+    for n in state['notes']:
+        outport.send(mido.Message('note_off', note=n, channel=state['channel']))
+    state['notes'] = set()
+    state['pinch_start_x'] = None
+    state['pinch_start_y'] = None
+    state['y_smooth'] = None  # 手が消えたらスムージングを初期化
+    state['pinch'] = 0.0
+    state['pos'] = None
+    state['active'] = False
+
+def assign_hands_to_slots(hand_landmarks_list):
+    """検出された各手をスロットに割り当てる。前フレームで近くにいたスロットを優先し、
+    同じ手が毎フレーム同じチャンネル・同じ状態を使い続けるようにする。"""
+    positions = [(lm[9].x, lm[9].y) for lm in hand_landmarks_list]  # 9番 = 中指の付け根（手のひら中心）
+    result = [None] * len(positions)
+    used = set()
+
+    # 1. 前フレームの位置に近い順に貪欲マッチング
+    pairs = []
+    for hi, (hx, hy) in enumerate(positions):
+        for si, st in enumerate(hand_states):
+            if st['active'] and st['pos'] is not None:
+                d = math.hypot(hx - st['pos'][0], hy - st['pos'][1])
+                if d < HAND_TRACK_MAX_DIST:
+                    pairs.append((d, hi, si))
+    for d, hi, si in sorted(pairs):
+        if result[hi] is None and si not in used:
+            result[hi] = si
+            used.add(si)
+
+    # 2. 新しく現れた手は空いているスロットへ（非アクティブなスロット優先）
+    for hi in range(len(positions)):
+        if result[hi] is None:
+            free = [si for si in range(MAX_HANDS) if si not in used]
+            free.sort(key=lambda si: (hand_states[si]['active'], si))
+            if not free:
+                continue
+            result[hi] = free[0]
+            used.add(free[0])
+    return result, positions
 
 last_hand_time = time.time()
 
@@ -698,13 +769,13 @@ try:
                     print("【切替】都節音階 (Miyakobushi) になりました")
 
                 # モードトグルボタン
-                elif is_in_rect(mouse_x, mouse_y, 40, 260, 160, 45):
+                elif is_in_rect(mouse_x, mouse_y, 40, 250, 160, 45):
                     WAVE_MODE = not WAVE_MODE
                     print(f"【切替】波形モードが {'ON' if WAVE_MODE else 'OFF'} になりました")
-                elif is_in_rect(mouse_x, mouse_y, 220, 260, 160, 45):
+                elif is_in_rect(mouse_x, mouse_y, 220, 250, 160, 45):
                     STRUM_MODE = not STRUM_MODE
                     print(f"【切替】和音モードが {'ON' if STRUM_MODE else 'OFF'} になりました")
-                elif is_in_rect(mouse_x, mouse_y, 400, 260, 160, 45):
+                elif is_in_rect(mouse_x, mouse_y, 400, 250, 160, 45):
                     AUTO_PLAY_ENABLED = not AUTO_PLAY_ENABLED
                     print(f"【切替】自動演奏機能が {'ON' if AUTO_PLAY_ENABLED else 'OFF'} になりました")
                     if not AUTO_PLAY_ENABLED:
@@ -745,12 +816,18 @@ try:
         # ------------------------------------
         # 手の位置から音程を計算してMIDI送信
         # ------------------------------------
+        frame_slots = []  # 検出された手ごとのスロット番号（描画処理でも使う）
         if detection_result.hand_landmarks and detection_result.handedness:
-            for hand_landmarks, handedness in zip(detection_result.hand_landmarks, detection_result.handedness):
+            frame_slots, palm_positions = assign_hands_to_slots(detection_result.hand_landmarks)
+            for hand_landmarks, handedness, slot, palm_pos in zip(detection_result.hand_landmarks, detection_result.handedness, frame_slots, palm_positions):
+                if slot is None:
+                    continue
                 hand_type = handedness[0].category_name
-                current_detected_hands.append(hand_type)
-                state = hand_states[hand_type]
+                current_detected_hands.append(slot)
+                state = hand_states[slot]
                 state['active'] = True
+                state['label'] = hand_type
+                state['pos'] = palm_pos
 
                 features = extract_hand_features(hand_landmarks)
                 state['pinch'] = features['pinch']
@@ -911,21 +988,9 @@ try:
                 auto_player.resume()
 
         # 画面から消えた手の後処理
-        for hand_type in ['Right', 'Left']:
-            if hand_type not in current_detected_hands:
-                state = hand_states[hand_type]
-                if state['active']:
-                    if state['note'] is not None:
-                        outport.send(mido.Message('note_off', note=state['note'], channel=state['channel']))
-                        state['note'] = None
-                    if state['notes']:
-                        for n in state['notes']:
-                            outport.send(mido.Message('note_off', note=n, channel=state['channel']))
-                        state['notes'].clear()
-                    state['pinch_start_x'] = None
-                    state['pinch_start_y'] = None
-                    state['y_smooth'] = None  # 手が消えたらスムージングを初期化
-                    state['active'] = False
+        for slot, state in enumerate(hand_states):
+            if slot not in current_detected_hands and state['active']:
+                release_hand(state)
 
         # ==========================================
         # 5. カメラ映像の表示 (HUD)
@@ -952,9 +1017,10 @@ try:
             if RAINBOW_LANES:
                 # 現在発音中の音（左手は1オクターブ下げて鳴らしているので+12して元のレーンに合わせる）
                 active_notes = set()
-                for ht in ['Right', 'Left']:
-                    st = hand_states[ht]
-                    shift = 12 if ht == 'Left' else 0
+                for st in hand_states:
+                    if not st['active']:
+                        continue
+                    shift = 12 if st['label'] == 'Left' else 0
                     if STRUM_MODE:
                         for n in st['notes']:
                             active_notes.add(n + shift)
@@ -1024,10 +1090,13 @@ try:
                 status_line = f"[{CURRENT_KEY}] | {wave_txt} | {strum_txt} | {auto_txt} | TH:{PINCH_THRESHOLD:.2f}"
                 cv2.putText(image, status_line, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
 
-                r_note = hand_states['Right']['note']
-                l_note = hand_states['Left']['note']
-                cv2.putText(image, f"R-Note: {midi_to_note_name(r_note)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                cv2.putText(image, f"L-Note: {midi_to_note_name(l_note)}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 100, 0), 2)
+                # 手ごとの発音状況（H1 = MIDI ch1, H2 = ch2 ...）
+                hand_txts = []
+                for slot, st in enumerate(hand_states):
+                    if st['active']:
+                        lr = 'L' if st['label'] == 'Left' else 'R'
+                        hand_txts.append(f"H{slot + 1}({lr}):{midi_to_note_name(st['note'])}")
+                cv2.putText(image, "  ".join(hand_txts) if hand_txts else "No hands", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
         else:
             # ------------------------------------
@@ -1071,9 +1140,8 @@ try:
             draw_button(image, "Rescan songs/ [S]", 320, 385, 260, 40, False, active_color=(0, 200, 255))
 
             # 指の狭さ（ピンチ判定しきい値）コントロール (最下段)
-            r_p = int(hand_states['Right'].get('pinch', 0.0) * 100)
-            l_p = int(hand_states['Left'].get('pinch', 0.0) * 100)
-            put_text_jp(image, f"Pinch Threshold: {PINCH_THRESHOLD:.2f} (Now R:{r_p}% L:{l_p}%)", (40, 442), 15, (255, 255, 255))
+            now_txt = " ".join(f"H{i + 1}:{int(st['pinch'] * 100)}%" for i, st in enumerate(hand_states) if st['active']) or "-"
+            put_text_jp(image, f"Pinch Threshold: {PINCH_THRESHOLD:.2f} (Now {now_txt})", (40, 442), 15, (255, 255, 255))
             draw_button(image, "[-] Down", 320, 435, 120, 38, False, active_color=(255, 200, 0))
             draw_button(image, "[+] Up", 460, 435, 120, 38, False, active_color=(255, 200, 0))
 
@@ -1081,9 +1149,10 @@ try:
         # 手の描画処理（演奏画面のときのみ表示）
         # ------------------------------------
         if UI_STATE == 'PLAY' and detection_result.hand_landmarks and detection_result.handedness:
-            for hand_landmarks, handedness in zip(detection_result.hand_landmarks, detection_result.handedness):
-                hand_type = handedness[0].category_name
-                state = hand_states[hand_type]
+            for hand_landmarks, slot in zip(detection_result.hand_landmarks, frame_slots):
+                if slot is None:
+                    continue
+                state = hand_states[slot]
 
                 # 親指(4番)の画面上のピクセル座標を計算
                 idx_x = int(hand_landmarks[4].x * w)
@@ -1135,6 +1204,11 @@ try:
         cv2.imshow('Theremin Camera', image)
 
         key = cv2.waitKey(5)
+
+        # ×ボタンでウィンドウが閉じられたら終了（そのままだと次の imshow でウィンドウが復活して閉じられない）
+        if cv2.getWindowProperty('Theremin Camera', cv2.WND_PROP_VISIBLE) < 1:
+            break
+
         if key != -1:
             key = key & 0xFF
             if key == 27:
@@ -1214,13 +1288,8 @@ finally:
     auto_player.stop()
 
     # 音の消音処理
-    for hand_type in ['Right', 'Left']:
-        state = hand_states[hand_type]
-        if state['note'] is not None:
-            outport.send(mido.Message('note_off', note=state['note'], channel=state['channel']))
-        if state['notes']:
-            for n in state['notes']:
-                outport.send(mido.Message('note_off', note=n, channel=state['channel']))
+    for state in hand_states:
+        release_hand(state)
 
     # 全チャンネル消音信号送信
     for ch in range(16):
