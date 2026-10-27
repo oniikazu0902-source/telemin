@@ -32,6 +32,20 @@
 #      （pause() の全消音直後に1音すべり込んで鳴りっぱなしになるのを防止）。
 #   4. ×ボタンでウィンドウを閉じたら終了するように変更。
 #   5. スクリプトの場所へ os.chdir するようにし、bat にも cd /d "%~dp0" を追加。
+#
+# Gemini へ（Claude より 2026-10-27）:
+#   Vital なしで鳴らせるよう、内蔵シンセ synth.py を追加しました。
+#   - SoftSynth は mido.Message を受け取る send() を持ち、numpy で音を合成して
+#     sounddevice で PC のオーディオ出力（3.5mm 端子 / USB-DAC）から直接鳴らします。
+#   - outport は OutputHub（内蔵シンセ + MIDI出力ポート）になりました。
+#     これまでどおり outport.send() するだけで両方に届くので、他の箇所の変更は不要です。
+#     MIDI出力ポートが無くても終了せず、内蔵シンセだけで動作します。
+#   - 外部MIDIコントローラーの入力も outport 経由で内蔵シンセが鳴らします。
+#   - 内蔵シンセは CC#7 をチャンネルごとに扱うので、連弾時に音量が干渉しません。
+#     CC#16（WAVEモード）はサイン波→ノコギリ波の連続変化、CC#1 はビブラート。
+#   - 設定は冒頭の USE_INTERNAL_SYNTH / AUDIO_DEVICE / USE_MIDI_OUT / MIDI_OUT_PORT。
+#     'o' キーで出力デバイス切り替え。依存関係は requirements.txt にまとめました。
+#   - start_telemin.bat は既定で Vital を起動しません（LAUNCH_VITAL=1 で従来どおり）。
 # ------------------------------------------------------------------
 import cv2
 import numpy as np
@@ -45,6 +59,7 @@ import threading
 import time
 import os
 import glob
+from synth import SoftSynth, OutputHub
 
 # どこから起動しても hand_landmarker.task や songs/ を見つけられるよう、スクリプトの場所を基準にする
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -89,6 +104,18 @@ PINCH_THRESHOLD = 0.70  # つまみ判定のしきい値（0.20〜0.95、キー�
 MAX_HANDS = 4
 # 前フレームの手と同一とみなす最大移動距離（画面幅を1.0とした割合）
 HAND_TRACK_MAX_DIST = 0.25
+
+# =======
+# 音の出力先
+# =======
+# 内蔵シンセ（synth.py）で合成し、PCのオーディオ出力（3.5mm端子 / USB-DAC 等）から直接鳴らす
+USE_INTERNAL_SYNTH = True
+# 出力デバイス名の一部（例: "Headphones", "USB Audio"）。None なら Windows の既定の出力先。
+# 起動時にコンソールへデバイス一覧が出るので、そこから選ぶ。演奏中は 'o' キーで切り替え可能
+AUDIO_DEVICE = None
+# Vital などの外部シンセにも MIDI を送る場合は True（ポートが無ければ自動で内蔵シンセのみになる）
+USE_MIDI_OUT = True
+MIDI_OUT_PORT = 'Default Basic App Loopback 1'
 
 # 波形変化モードのデフォルト状態
 WAVE_MODE = False
@@ -578,13 +605,29 @@ detector = vision.HandLandmarker.create_from_options(options)
 # ==========================================
 # 2. MIDI出力・入力ポートを開く
 # ==========================================
-# 出力ポート (Vital用仮想MIDI)
-try:
-    outport = mido.open_output('Default Basic App Loopback 1')
-    print("MIDI出力ポート 'Default Basic App Loopback 1' を開きました。")
-except OSError:
-    print("MIDI出力ポートが見つかりません。loopMIDIやWindows MIDI Servicesが有効か確認してください。")
+# 出力先は「内蔵シンセ（PCのオーディオ出力から直接発音）」と「MIDI出力ポート（Vital等）」の2系統。
+# 両方とも OutputHub にまとめ、以降のコードは outport.send() するだけで両方に届く。
+outputs = []
+
+# (1) 内蔵シンセ: PCのヘッドホン端子 / USB-DAC などから直接音を出す（Vital不要）
+synth = None
+if USE_INTERNAL_SYNTH:
+    synth = SoftSynth(device=AUDIO_DEVICE)
+    outputs.append(synth)
+
+# (2) MIDI出力ポート（Vital等の外部シンセ用）。見つからなくても内蔵シンセだけで動作する
+if USE_MIDI_OUT:
+    try:
+        outputs.append(mido.open_output(MIDI_OUT_PORT))
+        print(f"MIDI出力ポート '{MIDI_OUT_PORT}' を開きました。")
+    except OSError:
+        print(f"MIDI出力ポート '{MIDI_OUT_PORT}' が見つかりません（内蔵シンセのみで発音します）。")
+
+if not outputs:
+    print("出力先がありません。USE_INTERNAL_SYNTH か USE_MIDI_OUT を True にしてください。")
     exit()
+
+outport = OutputHub(outputs)
 
 # 入力ポート (MIDIコントローラーからPythonへの入力 ＆ スルー転送用)
 inport = None
@@ -599,7 +642,7 @@ for port in input_ports:
     if "Loopback" not in port and "loopMIDI" not in port:
         try:
             inport = mido.open_input(port)
-            print(f"MIDI入力コントローラーとして '{port}' を開きました。（MIDIスルー有効）")
+            print(f"MIDI入力コントローラーとして '{port}' を開きました。（内蔵シンセ / MIDI出力で発音）")
             break
         except OSError:
             pass
@@ -1113,6 +1156,10 @@ try:
             # 中央上にタイトル
             cv2.putText(image, "tElemin Settings", (220, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
+            # 内蔵シンセの出力先（デバイス名は日本語の場合があるので put_text_jp）
+            audio_txt = synth.device_name if synth is not None else "OFF"
+            put_text_jp(image, f"Audio Out [O]: {audio_txt}", (40, 52), 14, (180, 255, 180))
+
             # スケール選択ボタン (左列 1〜3)
             draw_button(image, "1. C Major", 40, 80, 250, 40, CURRENT_KEY == 'C_major')
             draw_button(image, "2. A Minor", 40, 135, 250, 40, CURRENT_KEY == 'A_minor')
@@ -1266,6 +1313,10 @@ try:
                 PINCH_THRESHOLD = round(min(0.95, PINCH_THRESHOLD + 0.05), 2)
                 auto_player.title_changed_at = time.time()
                 print(f"【設定変更】ピンチ判定しきい値: {PINCH_THRESHOLD:.2f}")
+            elif key == ord('o'):
+                # 内蔵シンセのオーディオ出力デバイスを順番に切り替え
+                if synth is not None:
+                    synth.next_device()
             elif key == ord('f'):
                 FULLSCREEN = not FULLSCREEN
                 apply_window_mode('Theremin Camera', FULLSCREEN)
