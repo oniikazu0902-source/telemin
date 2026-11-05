@@ -12,6 +12,8 @@
 #   CC#7  (Volume)          : チャンネル音量（ピンチの強さ）
 #   CC#16 (WAVE)            : 波形を サイン波(0) → ノコギリ波(127) に連続変化
 #   CC#1  (Modulation)      : ビブラートの深さ
+#   CC#74 (Filter Cutoff)   : ローパスフィルターの明るさ（0=こもった音 〜 127=フィルター全開）
+#   CC#71 (Resonance)       : フィルターのクセ（カットオフ付近の強調）
 #   CC#123 / CC#120         : 全消音
 #   pitchwheel              : ±2半音のピッチベンド
 # ==========================================
@@ -22,6 +24,12 @@ try:
     import sounddevice as sd
 except ImportError:  # 未インストールでも telemin.py 自体は起動できるようにする
     sd = None
+
+try:
+    # フィルター計算（1サンプルずつの再帰計算）は Python では遅すぎるため scipy の C 実装を使う
+    from scipy.signal import lfilter
+except ImportError:
+    lfilter = None
 
 
 class _Voice:
@@ -44,6 +52,9 @@ class SoftSynth:
     MASTER_GAIN = 0.22     # 全体音量（大きくすると歪みやすい）
     DEFAULT_WAVE = 0.35    # WAVE モード OFF 時の音色（0=サイン波, 1=ノコギリ波）
     VIBRATO_HZ = 5.5
+    CUTOFF_MIN_HZ = 180.0      # CC#74 = 0 のときのカットオフ周波数
+    CUTOFF_MAX_HZ = 14000.0    # CC#74 = 127 のときのカットオフ周波数
+    CUTOFF_SMOOTH = 0.35       # 1ブロック(約5ms)ごとに目標へ近づく割合（急変によるプチノイズ防止）
 
     def __init__(self, device=None, blocksize=256):
         self.blocksize = blocksize
@@ -55,7 +66,15 @@ class SoftSynth:
         self.ch_wave = [self.DEFAULT_WAVE] * 16
         self.ch_bend = [0.0] * 16   # 半音単位
         self.ch_mod = [0.0] * 16    # 0.0〜1.0
+        self.ch_cutoff = [1.0] * 16       # 0.0〜1.0（既定は全開 = フィルターなしと同じ音）
+        self._ch_cutoff_now = [1.0] * 16
+        self.ch_reso = [0.0] * 16         # 0.0〜1.0
+        self._filter_zi = [np.zeros(2) for _ in range(16)]  # フィルターの内部状態（チャンネルごと）
+        self._filter_coef = [None] * 16   # (cutoff, reso, b, a) のキャッシュ
         self._vib_phase = 0.0
+
+        if lfilter is None:
+            print("【内蔵シンセ】scipy が見つからないため、フィルター(CC#74)は無効です。`pip install scipy` を実行してください。")
         self.stream = None
         self.samplerate = 48000
         self.device_name = "(none)"
@@ -171,6 +190,10 @@ class SoftSynth:
                 self.ch_wave[ch] = val
             elif msg.control == 1:
                 self.ch_mod[ch] = val
+            elif msg.control == 74:
+                self.ch_cutoff[ch] = val
+            elif msg.control == 71:
+                self.ch_reso[ch] = val
             elif msg.control in (120, 123):
                 self._channel_off(ch)
         elif t == 'pitchwheel':
@@ -224,6 +247,7 @@ class SoftSynth:
 
         # チャンネル音量はブロック内で直線補間して「ジジジ」というノイズを防ぐ
         vol_ramp = {}
+        ch_mix = {}  # チャンネルごとの合成結果（フィルターはチャンネル単位でかける）
 
         with self.lock:
             dead = []
@@ -270,15 +294,58 @@ class SoftSynth:
 
                 w = self.ch_wave[ch]
                 wave = (1.0 - w) * sine + w * 0.6 * saw
-                mix += wave * env * v.velocity * vol_ramp[ch]
+                voice_out = wave * env * v.velocity * vol_ramp[ch]
+                if ch in ch_mix:
+                    ch_mix[ch] += voice_out
+                else:
+                    ch_mix[ch] = voice_out
 
             for key in dead:
                 del self.voices[key]
+
+        # チャンネルごとにローパスフィルター（CC#74）をかけてから合算する
+        for ch in range(16):
+            if ch not in ch_mix:
+                # 鳴っていないチャンネルは内部状態をリセット（次の発音時に古い残響が混ざらないように）
+                self._filter_zi[ch][:] = 0.0
+                self._ch_cutoff_now[ch] = self.ch_cutoff[ch]
+                continue
+            mix += self._apply_filter(ch, ch_mix[ch])
 
         # ソフトクリップで音割れを防ぐ
         out = np.tanh(mix * self.MASTER_GAIN).astype(np.float32)
         outdata[:, 0] = out
         outdata[:, 1] = out
+
+    def _apply_filter(self, ch, x):
+        """RBJ方式の2次ローパスフィルター。カットオフが全開でレゾナンスも0なら素通し"""
+        if lfilter is None:
+            return x
+        now = self._ch_cutoff_now[ch]
+        now += (self.ch_cutoff[ch] - now) * self.CUTOFF_SMOOTH
+        self._ch_cutoff_now[ch] = now
+        reso = self.ch_reso[ch]
+        if now >= 0.999 and reso <= 0.001:
+            self._filter_zi[ch][:] = 0.0
+            return x
+
+        cached = self._filter_coef[ch]
+        if cached is None or abs(cached[0] - now) > 1e-4 or cached[1] != reso:
+            # 0〜1 を指数カーブで周波数に対応させる（耳の感覚に近い変化になる）
+            fc = self.CUTOFF_MIN_HZ * (self.CUTOFF_MAX_HZ / self.CUTOFF_MIN_HZ) ** now
+            fc = min(fc, self.samplerate * 0.45)
+            q = 0.707 + reso * 7.0
+            w0 = 2.0 * np.pi * fc / self.samplerate
+            alpha = np.sin(w0) / (2.0 * q)
+            cos_w0 = np.cos(w0)
+            a0 = 1.0 + alpha
+            b = np.array([(1.0 - cos_w0) / 2.0, 1.0 - cos_w0, (1.0 - cos_w0) / 2.0]) / a0
+            a = np.array([1.0, -2.0 * cos_w0 / a0, (1.0 - alpha) / a0])
+            cached = (now, reso, b, a)
+            self._filter_coef[ch] = cached
+
+        y, self._filter_zi[ch] = lfilter(cached[2], cached[3], x, zi=self._filter_zi[ch])
+        return y
 
     def close(self):
         if self.stream is not None:

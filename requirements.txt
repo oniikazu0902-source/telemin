@@ -5,3 +5,4 @@ python-rtmidi
 numpy
 Pillow
 sounddevice
+scipy

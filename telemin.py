@@ -46,6 +46,17 @@
 #   - 設定は冒頭の USE_INTERNAL_SYNTH / AUDIO_DEVICE / USE_MIDI_OUT / MIDI_OUT_PORT。
 #     'o' キーで出力デバイス切り替え。依存関係は requirements.txt にまとめました。
 #   - start_telemin.bat は既定で Vital を起動しません（LAUNCH_VITAL=1 で従来どおり）。
+#
+# Gemini へ（Claude より 2026-11-05）:
+#   README の「Filter Cutoff（CC#74）」を実装しました。
+#   - FILTER_MODE（'c' キー / 設定画面の FILTER ボタン）で ON/OFF。
+#   - extract_hand_features() に features['tilt_deg']（手首0番→中指の付け根9番の傾き）を追加し、
+#     外側へ傾けるほど明るくなるよう左手は反転して CC#74 を送ります。値が変わったときだけ送信。
+#     以前のプレースホルダー features['filter_cutoff']（中指の高さ）は音程と連動してしまうため削除しました。
+#   - 手が消えたとき・FILTER_MODE を OFF にしたときは reset_filter() で CC#74=127（全開）に戻します。
+#   - synth.py に RBJ 2次ローパスフィルター（CC#74 カットオフ / CC#71 レゾナンス）を追加。
+#     チャンネルごとにかけるので、連弾でも手ごとに別々の明るさになります。scipy が必要です。
+#   - 設定画面の中段は DEBUG / RAINBOW / FILTER の3つを、上段と同じ 160px 幅で並べ直しました。
 # ------------------------------------------------------------------
 import cv2
 import numpy as np
@@ -119,6 +130,12 @@ MIDI_OUT_PORT = 'Default Basic App Loopback 1'
 
 # 波形変化モードのデフォルト状態
 WAVE_MODE = False
+
+# フィルターモード（手の傾きで音の明るさ = Filter Cutoff CC#74 を操作）。'c' キーで切り替え
+# 手を外側（右手は右、左手は左）へ傾けるほど明るく、内側へ傾けるほどこもった音になる
+FILTER_MODE = False
+FILTER_TILT_RANGE = 50.0  # この角度（度）まで傾けると最大/最小になる
+FILTER_DEFAULT_CC = 127   # フィルターOFF時や手が消えたときに戻す値（127 = 全開 = 従来の音）
 
 # 和音モード（ひも引っ張り発音）のデフォルト状態（デフォルトOFF）
 STRUM_MODE = False
@@ -290,7 +307,8 @@ def midi_to_note_name(note):
 # ==========================================
 # わけわからん
 # ==========================================
-def extract_hand_features(hand_landmarks):
+def extract_hand_features(hand_landmarks, aspect=1.0):
+    """aspect は映像の 幅/高さ。手の傾きの角度を正しく測るために使う"""
     features = {}
 
     # 【音程用】親指の先端(4番)のY座標 (0.0=上, 1.0=下) ※変更不要箇所
@@ -308,12 +326,18 @@ def extract_hand_features(hand_landmarks):
     # 【今後の拡張用】手首(0番)のY座標など
     features['wrist_y'] = hand_landmarks[0].y
 
+    # 【フィルター用】手の傾き（手首0番 → 中指の付け根9番 の向き）
+    # 指先が真上 = 0度、画面の右へ傾く = プラス、左へ傾く = マイナス（度）。
+    # 音程(Y)・ピンチ・波形(X)とは独立に動かせるので、演奏しながら音の明るさを変えられる
+    # 正規化座標は縦横の縮尺が違うので、x に aspect を掛けて実際の角度にする
+    wrist = hand_landmarks[0]
+    palm = hand_landmarks[9]
+    features['tilt_deg'] = math.degrees(math.atan2((palm.x - wrist.x) * aspect, wrist.y - palm.y))
+
     # 💡 【将来の拡張用CC候補スロット】
-    # 1. Filter Cutoff (CC#74): 例として中指のピンチや手の傾きを使用可能
-    # 2. Modulation Wheel (CC#1): 例として小指の曲げ具合や手の細かな震え
-    # 3. Resonance (CC#71): 例として薬指の位置
+    # 1. Modulation Wheel (CC#1): 例として小指の曲げ具合や手の細かな震え
+    # 2. Resonance (CC#71): 例として薬指の位置
     # 今はデフォルト値をプレースホルダーとして定義しておきます
-    features['filter_cutoff'] = max(0.0, min(1.0, 1.0 - hand_landmarks[12].y))  # 中指の高さでカットオフ
     features['modulation_wheel'] = 0.0  # 今後実装
     features['resonance'] = 0.5  # 今後実装
 
@@ -685,8 +709,26 @@ def new_hand_state(channel):
         'active': False,
         'pinch': 0.0,
         'label': 'Right',  # MediaPipe の左右判定（左手は1オクターブ下げるのに使う）
-        'pos': None        # 前フレームの手のひら中心（スロット追跡用）
+        'pos': None,       # 前フレームの手のひら中心（スロット追跡用）
+        'cutoff_smooth': None,  # フィルター値（0.0〜1.0）の平滑化用
+        'cutoff_cc': None       # 最後に送った CC#74 の値（同じ値を毎フレーム送らないため）
     }
+
+def toggle_filter_mode():
+    global FILTER_MODE
+    FILTER_MODE = not FILTER_MODE
+    if not FILTER_MODE:
+        # OFF にしたら、こもった音のまま残らないよう全チャンネルのフィルターを全開に戻す
+        for st in hand_states:
+            reset_filter(st)
+    print(f"【切替】フィルターモードが {'ON' if FILTER_MODE else 'OFF'} になりました")
+
+def reset_filter(state):
+    """そのスロットのチャンネルのフィルターを全開（従来の音）に戻す"""
+    if state['cutoff_cc'] is not None and state['cutoff_cc'] != FILTER_DEFAULT_CC:
+        outport.send(mido.Message('control_change', control=74, value=FILTER_DEFAULT_CC, channel=state['channel']))
+    state['cutoff_smooth'] = None
+    state['cutoff_cc'] = None
 
 hand_states = [new_hand_state(i) for i in range(MAX_HANDS)]
 
@@ -704,6 +746,8 @@ def release_hand(state):
     state['pinch'] = 0.0
     state['pos'] = None
     state['active'] = False
+    # 手が消えたらフィルターも戻す（自動演奏などで同じチャンネルがこもった音のままにならないように）
+    reset_filter(state)
 
 def assign_hands_to_slots(hand_landmarks_list):
     """検出された各手をスロットに割り当てる。前フレームで近くにいたスロットを優先し、
@@ -825,12 +869,14 @@ try:
                         auto_player.pause()
 
                 # 追加トグルボタン（中段）
-                elif is_in_rect(mouse_x, mouse_y, 40, 310, 250, 40):
+                elif is_in_rect(mouse_x, mouse_y, 40, 310, 160, 40):
                     SHOW_DEBUG = not SHOW_DEBUG
                     print(f"【切替】デバッグ表示が {'ON' if SHOW_DEBUG else 'OFF'} になりました")
-                elif is_in_rect(mouse_x, mouse_y, 310, 310, 250, 40):
+                elif is_in_rect(mouse_x, mouse_y, 220, 310, 160, 40):
                     RAINBOW_LANES = not RAINBOW_LANES
                     print(f"【切替】虹色レーンが {'ON' if RAINBOW_LANES else 'OFF'} になりました")
+                elif is_in_rect(mouse_x, mouse_y, 400, 310, 160, 40):
+                    toggle_filter_mode()
 
                 # 自動演奏曲選択 & ディレクトリ再スキャンボタン（下段）
                 elif is_in_rect(mouse_x, mouse_y, 40, 385, 120, 40):
@@ -872,7 +918,7 @@ try:
                 state['label'] = hand_type
                 state['pos'] = palm_pos
 
-                features = extract_hand_features(hand_landmarks)
+                features = extract_hand_features(hand_landmarks, aspect=w / h)
                 state['pinch'] = features['pinch']
 
                 raw_y = features['index_y']
@@ -916,6 +962,22 @@ try:
                 # WAVE_MODEがTrueのときのみX座標（CC#16）を送信
                 if WAVE_MODE:
                     outport.send(mido.Message('control_change', control=16, value=x_cc_value, channel=state['channel']))
+
+                # FILTER_MODEがTrueのときのみ、手の傾きで Filter Cutoff（CC#74）を送信
+                if FILTER_MODE:
+                    # 「外側へ傾ける = 明るい」に揃えるため、左手は角度を反転する
+                    tilt_out = features['tilt_deg'] if hand_type != 'Left' else -features['tilt_deg']
+                    cutoff = 0.5 + tilt_out / (2.0 * FILTER_TILT_RANGE)
+                    cutoff = max(0.0, min(1.0, cutoff))
+                    # 手の傾きは細かく揺れやすいので、音程と同じく EMA で平滑化する
+                    if state['cutoff_smooth'] is None:
+                        state['cutoff_smooth'] = cutoff
+                    else:
+                        state['cutoff_smooth'] = 0.25 * cutoff + 0.75 * state['cutoff_smooth']
+                    cutoff_cc = int(round(state['cutoff_smooth'] * 127))
+                    if cutoff_cc != state['cutoff_cc']:
+                        outport.send(mido.Message('control_change', control=74, value=cutoff_cc, channel=state['channel']))
+                        state['cutoff_cc'] = cutoff_cc
 
                 # つまみ判定かつ演奏境界線内のときのみ発音有効（端の外では一切反応させない）
                 is_pinching = (features['pinch'] >= PINCH_THRESHOLD) and in_play_zone
@@ -1130,7 +1192,8 @@ try:
                 wave_txt = "WAVE:ON" if WAVE_MODE else "WAVE:OFF"
                 strum_txt = "STRUM:ON" if STRUM_MODE else "STRUM:OFF"
                 auto_txt = "AUTO:ON" if AUTO_PLAY_ENABLED else "AUTO:OFF"
-                status_line = f"[{CURRENT_KEY}] | {wave_txt} | {strum_txt} | {auto_txt} | TH:{PINCH_THRESHOLD:.2f}"
+                filter_txt = "FILTER:ON" if FILTER_MODE else "FILTER:OFF"
+                status_line = f"[{CURRENT_KEY}] | {wave_txt} | {filter_txt} | {strum_txt} | {auto_txt} | TH:{PINCH_THRESHOLD:.2f}"
                 cv2.putText(image, status_line, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
 
                 # 手ごとの発音状況（H1 = MIDI ch1, H2 = ch2 ...）
@@ -1176,8 +1239,9 @@ try:
             draw_button(image, f"AUTO: {'ON' if AUTO_PLAY_ENABLED else 'OFF'}", 400, 250, 160, 45, AUTO_PLAY_ENABLED)
 
             # 追加トグルボタン (中段)
-            draw_button(image, f"DEBUG [d]: {'ON' if SHOW_DEBUG else 'OFF'}", 40, 310, 250, 40, SHOW_DEBUG)
-            draw_button(image, f"RAINBOW [r]: {'ON' if RAINBOW_LANES else 'OFF'}", 310, 310, 250, 40, RAINBOW_LANES)
+            draw_button(image, f"DEBUG: {'ON' if SHOW_DEBUG else 'OFF'}", 40, 310, 160, 40, SHOW_DEBUG)
+            draw_button(image, f"RAINBOW: {'ON' if RAINBOW_LANES else 'OFF'}", 220, 310, 160, 40, RAINBOW_LANES)
+            draw_button(image, f"FILTER: {'ON' if FILTER_MODE else 'OFF'}", 400, 310, 160, 40, FILTER_MODE)
 
             # 自動演奏ソング選択コントロール (下段)
             cur_song_title = auto_player.get_current_title()
@@ -1247,6 +1311,17 @@ try:
                     else:
                         cv2.circle(image, (idx_x, idx_y), 14, (255, 255, 255), 2)
 
+                # フィルターモード中は、マーカーの下に音の明るさメーター（暗い青 → 明るい黄）を表示
+                if FILTER_MODE and state['cutoff_smooth'] is not None:
+                    bar_w, bar_h = 50, 6
+                    bx, by = idx_x - bar_w // 2, idx_y + 22
+                    fill = int(bar_w * state['cutoff_smooth'])
+                    v = state['cutoff_smooth']
+                    bar_color = (int(200 * (1 - v)), int(80 + 175 * v), int(255 * v))  # BGR
+                    cv2.rectangle(image, (bx, by), (bx + bar_w, by + bar_h), (40, 40, 40), -1)
+                    cv2.rectangle(image, (bx, by), (bx + fill, by + bar_h), bar_color, -1)
+                    cv2.rectangle(image, (bx, by), (bx + bar_w, by + bar_h), (255, 255, 255), 1)
+
         # 映像を表示（黒帯なしでウィンドウ・全画面に完全追従）
         cv2.imshow('Theremin Camera', image)
 
@@ -1313,6 +1388,8 @@ try:
                 PINCH_THRESHOLD = round(min(0.95, PINCH_THRESHOLD + 0.05), 2)
                 auto_player.title_changed_at = time.time()
                 print(f"【設定変更】ピンチ判定しきい値: {PINCH_THRESHOLD:.2f}")
+            elif key == ord('c'):
+                toggle_filter_mode()
             elif key == ord('o'):
                 # 内蔵シンセのオーディオ出力デバイスを順番に切り替え
                 if synth is not None:
