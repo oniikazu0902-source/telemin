@@ -57,6 +57,21 @@
 #   - synth.py に RBJ 2次ローパスフィルター（CC#74 カットオフ / CC#71 レゾナンス）を追加。
 #     チャンネルごとにかけるので、連弾でも手ごとに別々の明るさになります。scipy が必要です。
 #   - 設定画面の中段は DEBUG / RAINBOW / FILTER の3つを、上段と同じ 160px 幅で並べ直しました。
+#
+# Gemini へ（Claude より 2026-11-10）:
+#   「ステップ演奏モード」を追加しました。つまむたびに MIDI の次の音（和音はまとめて）が鳴り、
+#   手の高さに関係なく曲どおりに演奏しているように聞こえます。
+#   - STEP_MODE（'t' キー / 設定画面の STEP ボタン）で ON/OFF。'b' キーで曲の頭に戻ります。
+#   - 曲は自動演奏と同じ songs/ の「今選んでいる曲」（N / P で切替）。曲が変わると自動で読み直します。
+#   - load_step_song() が (トラック, チャンネル) ごとにパートを分け、ドラム(ch10)を除き、
+#     音数16以上で平均音高が一番高いパートをメロディとして自動選択。同時（STEP_CHORD_TOLERANCE 以内）の
+#     音は1ステップの和音にまとめます。パートは STEP_PARTS で曲ごとに指定可能（起動時/曲切替時に一覧を表示）。
+#   - 曲の進み位置 step_cursor は全部の手で共有。連弾や両手交互で速いフレーズも追えます。
+#   - 離した判定は PINCH_THRESHOLD - STEP_RELEASE_MARGIN（ヒステリシス）にして、指の震えでの連打を防止。
+#   - 手ごとの状態は new_hand_state() の step_notes / step_pinched / step_last_time / lane_note。
+#     release_hand() でステップの音も止まります。モード切替時は stop_hand_notes() で全スロットを消音。
+#   - 虹レーンは、つまんでいる間「手の高さのレーン」を光らせます。演奏画面の下端に曲の進み具合バー。
+#   - 設定画面の下段（曲選択の行）を Prev / Next / Rescan / STEP の4つに詰めました。
 # ------------------------------------------------------------------
 import cv2
 import numpy as np
@@ -152,6 +167,16 @@ RAINBOW_LANES = True
 RAINBOW_ALPHA = 0.30         # 通常レーンの濃さ（0.0〜1.0）
 RAINBOW_ACTIVE_ALPHA = 0.70  # 発音中レーンの濃さ（0.0〜1.0）
 RAINBOW_SPEED = 0.15         # 虹が流れる速さ（1秒あたり色相が1周する割合）
+
+# ステップ演奏モード（つまむたびに、songs/ で選んでいる曲の次の音へ進む）
+# 't' キー / 設定画面の STEP ボタンで切り替え、'b' キーで曲の頭に戻る
+STEP_MODE = False
+# 鳴らすパートを曲ごとに指定（ファイル名: パート番号のリスト）。書いていない曲はメロディを自動選択。
+# パート番号は、ステップ演奏で曲を読み込んだときにコンソールへ一覧が出る。例: {'canon.mid': [0, 1]}
+STEP_PARTS = {}
+STEP_CHORD_TOLERANCE = 1 / 24  # このズレ（拍に対する割合）以内に鳴る音は「同時＝和音」として1ステップにまとめる
+STEP_RELEASE_MARGIN = 0.10     # 「離した」判定は PINCH_THRESHOLD よりこれだけ低く（指の震えでの連打防止）
+STEP_MIN_INTERVAL = 0.06       # 次のステップへ進める最短間隔（秒）
 
 # UIの状態管理 ('PLAY' = 演奏画面, 'SETTINGS' = 設定画面)
 UI_STATE = 'PLAY'
@@ -303,6 +328,63 @@ def midi_to_note_name(note):
     octave = (note // 12) - 1
     name = note_names[note % 12]
     return f"{name}{octave}"
+
+# ==========================================
+# ステップ演奏用：MIDIファイルを「つまむたびに鳴らす音のかたまり」のリストに変換
+# ==========================================
+def load_step_song(path, part_indices=None):
+    mid = mido.MidiFile(path)
+    tol = max(1, int(mid.ticks_per_beat * STEP_CHORD_TOLERANCE))
+
+    # (トラック, チャンネル) ごとに発音タイミングを集める（1トラックに全パートが入った形式0のMIDIにも対応）
+    parts = {}
+    for ti, track in enumerate(mid.tracks):
+        tick = 0
+        for msg in track:
+            tick += msg.time
+            # ch10（channel=9）はドラムなので除外
+            if msg.type == 'note_on' and msg.velocity > 0 and msg.channel != 9:
+                key = (ti, msg.channel)
+                if key not in parts:
+                    parts[key] = {'name': track.name, 'onsets': []}
+                parts[key]['onsets'].append((tick, msg.note, msg.velocity))
+
+    part_list = sorted(parts.items())
+    if not part_list:
+        return []
+
+    def avg_pitch(i):
+        ons = part_list[i][1]['onsets']
+        return sum(n for _, n, _ in ons) / len(ons)
+
+    print(f"--- ステップ演奏用パート一覧 ({os.path.basename(path)}) ---")
+    for i, ((ti, ch), p) in enumerate(part_list):
+        print(f"  [{i}] Track{ti} '{p['name']}' ch{ch + 1}: {len(p['onsets'])}音, 平均音高 {midi_to_note_name(int(avg_pitch(i)))}")
+
+    valid = [i for i in (part_indices or []) if 0 <= i < len(part_list)]
+    if not valid:
+        # 自動選択：16音以上あるパートのうち、平均音高が一番高いもの＝メロディとみなす
+        candidates = [i for i, (_, p) in enumerate(part_list) if len(p['onsets']) >= 16]
+        if not candidates:
+            candidates = list(range(len(part_list)))
+        valid = [max(candidates, key=avg_pitch)]
+    print(f"  → 使用パート: {valid}（変えたい場合は STEP_PARTS に指定）")
+    print("------------------------------------------")
+
+    onsets = []
+    for i in valid:
+        onsets.extend(part_list[i][1]['onsets'])
+    onsets.sort()
+
+    # ほぼ同時に鳴る音を1ステップ（和音）にまとめる
+    steps = []
+    group_tick = None
+    for tick, note, vel in onsets:
+        if group_tick is None or tick - group_tick > tol:
+            steps.append({})
+            group_tick = tick
+        steps[-1][note] = max(vel, steps[-1].get(note, 0))
+    return [sorted(s.items()) for s in steps]
 
 # ==========================================
 # わけわからん
@@ -711,7 +793,11 @@ def new_hand_state(channel):
         'label': 'Right',  # MediaPipe の左右判定（左手は1オクターブ下げるのに使う）
         'pos': None,       # 前フレームの手のひら中心（スロット追跡用）
         'cutoff_smooth': None,  # フィルター値（0.0〜1.0）の平滑化用
-        'cutoff_cc': None       # 最後に送った CC#74 の値（同じ値を毎フレーム送らないため）
+        'cutoff_cc': None,      # 最後に送った CC#74 の値（同じ値を毎フレーム送らないため）
+        'step_notes': set(),    # ステップ演奏でこの手が今鳴らしている音
+        'step_pinched': False,  # ステップ演奏のつまみ中フラグ（1回つまむ＝1ステップ）
+        'step_last_time': 0.0,
+        'lane_note': None       # ステップ演奏中に虹レーンで光らせる音（手の高さのレーン）
     }
 
 def toggle_filter_mode():
@@ -732,16 +818,23 @@ def reset_filter(state):
 
 hand_states = [new_hand_state(i) for i in range(MAX_HANDS)]
 
-def release_hand(state):
-    """手が消えたスロットの音を止めて状態を初期化する"""
+def stop_hand_notes(state):
+    """そのスロットで鳴っている音（通常・和音・ステップ）をすべて止める。手の追跡状態はそのまま"""
     if state['note'] is not None:
         outport.send(mido.Message('note_off', note=state['note'], channel=state['channel']))
         state['note'] = None
-    for n in state['notes']:
+    for n in state['notes'] | state['step_notes']:
         outport.send(mido.Message('note_off', note=n, channel=state['channel']))
     state['notes'] = set()
+    state['step_notes'] = set()
+    state['step_pinched'] = False
+    state['lane_note'] = None
     state['pinch_start_x'] = None
     state['pinch_start_y'] = None
+
+def release_hand(state):
+    """手が消えたスロットの音を止めて状態を初期化する"""
+    stop_hand_notes(state)
     state['y_smooth'] = None  # 手が消えたらスムージングを初期化
     state['pinch'] = 0.0
     state['pos'] = None
@@ -779,6 +872,52 @@ def assign_hands_to_slots(hand_landmarks_list):
             result[hi] = free[0]
             used.add(free[0])
     return result, positions
+
+# ------------------------------------
+# ステップ演奏の曲管理（自動演奏と同じ songs/ の「今選んでいる曲」を使う）
+# ------------------------------------
+step_song = []          # ステップのリスト。1ステップ = [(note, velocity), ...]
+step_song_path = None   # 読み込み済みの曲のパス（曲が切り替わったら読み直す）
+step_song_title = ""
+step_cursor = 0         # 次に鳴らすステップ（全部の手で共有）
+step_toast_at = 0.0     # 曲名トーストを出し始めた時刻
+
+def current_song_path():
+    with auto_player.lock:
+        if not auto_player.songs:
+            return None, ""
+        song = auto_player.songs[auto_player.current_idx]
+        return song['path'], song['title']
+
+def sync_step_song():
+    """選んでいる曲が変わっていたら読み込み直す。曲が無ければ空のまま"""
+    global step_song, step_song_path, step_song_title, step_cursor, step_toast_at
+    path, title = current_song_path()
+    if path == step_song_path:
+        return
+    for st in hand_states:
+        stop_hand_notes(st)
+    step_song_path, step_song_title, step_cursor = path, title, 0
+    step_song = []
+    if path is not None:
+        try:
+            step_song = load_step_song(path, STEP_PARTS.get(os.path.basename(path)))
+            print(f"【ステップ演奏】'{title}' を読み込みました（{len(step_song)}ステップ）")
+        except Exception as e:
+            print(f"【ステップ演奏】'{title}' の読み込みに失敗しました: {e}")
+    step_toast_at = time.time()
+
+def toggle_step_mode():
+    global STEP_MODE, step_toast_at
+    for st in hand_states:
+        stop_hand_notes(st)  # 他のモードの音が残らないように
+    STEP_MODE = not STEP_MODE
+    if STEP_MODE:
+        sync_step_song()
+        step_toast_at = time.time()
+        if not step_song:
+            print("【ステップ演奏】songs/ に演奏できるMIDIがありません")
+    print(f"【切替】ステップ演奏モードが {'ON' if STEP_MODE else 'OFF'} になりました")
 
 last_hand_time = time.time()
 
@@ -878,13 +1017,15 @@ try:
                 elif is_in_rect(mouse_x, mouse_y, 400, 310, 160, 40):
                     toggle_filter_mode()
 
-                # 自動演奏曲選択 & ディレクトリ再スキャンボタン（下段）
-                elif is_in_rect(mouse_x, mouse_y, 40, 385, 120, 40):
+                # 自動演奏曲選択 & ディレクトリ再スキャン & ステップ演奏ボタン（下段）
+                elif is_in_rect(mouse_x, mouse_y, 40, 385, 110, 40):
                     auto_player.prev_song()
-                elif is_in_rect(mouse_x, mouse_y, 180, 385, 120, 40):
+                elif is_in_rect(mouse_x, mouse_y, 165, 385, 110, 40):
                     auto_player.next_song()
-                elif is_in_rect(mouse_x, mouse_y, 320, 385, 260, 40):
+                elif is_in_rect(mouse_x, mouse_y, 290, 385, 130, 40):
                     auto_player.scan_songs()
+                elif is_in_rect(mouse_x, mouse_y, 435, 385, 145, 40):
+                    toggle_step_mode()
 
                 # 指の狭さ（ピンチ判定しきい値）調整ボタン (最下段)
                 elif is_in_rect(mouse_x, mouse_y, 320, 435, 120, 38):
@@ -905,6 +1046,10 @@ try:
         # ------------------------------------
         # 手の位置から音程を計算してMIDI送信
         # ------------------------------------
+        # ステップ演奏中は、N / P などで曲が変わったら読み直す
+        if STEP_MODE:
+            sync_step_song()
+
         frame_slots = []  # 検出された手ごとのスロット番号（描画処理でも使う）
         if detection_result.hand_landmarks and detection_result.handedness:
             frame_slots, palm_positions = assign_hands_to_slots(detection_result.hand_landmarks)
@@ -982,7 +1127,38 @@ try:
                 # つまみ判定かつ演奏境界線内のときのみ発音有効（端の外では一切反応させない）
                 is_pinching = (features['pinch'] >= PINCH_THRESHOLD) and in_play_zone
 
-                if STRUM_MODE:
+                if STEP_MODE:
+                    # ------------------------------------
+                    # 【ステップ演奏モード】つまむたびに曲の次の音へ進む（手の高さは関係なし）
+                    # ------------------------------------
+                    now = time.time()
+                    if not state['step_pinched']:
+                        if is_pinching and step_song and now - state['step_last_time'] >= STEP_MIN_INTERVAL:
+                            state['step_pinched'] = True
+                            state['step_last_time'] = now
+                            step_notes = step_song[step_cursor]
+                            step_cursor = (step_cursor + 1) % len(step_song)
+                            if step_cursor == 0:
+                                print("【ステップ演奏】曲の最後まで来たので先頭に戻ります")
+                            for n, v in step_notes:
+                                # 自動演奏と同じく、ベロシティを聞きやすい範囲(55〜110)に収める
+                                vel = max(55, min(110, v))
+                                outport.send(mido.Message('note_on', note=n, velocity=vel, channel=state['channel']))
+                                state['step_notes'].add(n)
+                    elif features['pinch'] < PINCH_THRESHOLD - STEP_RELEASE_MARGIN or not in_play_zone:
+                        # 指を離した（または演奏エリアの外に出た）ら、そのステップの音を止める
+                        for n in state['step_notes']:
+                            outport.send(mido.Message('note_off', note=n, channel=state['channel']))
+                        state['step_notes'] = set()
+                        state['step_pinched'] = False
+
+                    # 見た目用：つまんでいる間は手の高さのレーンを光らせる（左手は1オクターブ下げた分を戻す）
+                    if state['step_pinched']:
+                        state['lane_note'] = note + (12 if hand_type == 'Left' else 0)
+                    else:
+                        state['lane_note'] = None
+
+                elif STRUM_MODE:
                     # ------------------------------------
                     # 【和音モード】ひも引っ張り発音
                     # ------------------------------------
@@ -1126,7 +1302,10 @@ try:
                     if not st['active']:
                         continue
                     shift = 12 if st['label'] == 'Left' else 0
-                    if STRUM_MODE:
+                    if STEP_MODE:
+                        if st['lane_note'] is not None:
+                            active_notes.add(st['lane_note'])
+                    elif STRUM_MODE:
                         for n in st['notes']:
                             active_notes.add(n + shift)
                     elif st['note'] is not None:
@@ -1181,6 +1360,21 @@ try:
                 cur_song_title = auto_player.get_current_title()
                 put_text_jp(image, f"AutoSong: {cur_song_title}  [N:Next / P:Prev / S:Scan]", (50, 103), 15, (0, 255, 255), bg_color=(30, 30, 30))
 
+            # ステップ演奏の曲名トースト（ON にしたとき・曲が変わったときだけ数秒表示）
+            if STEP_MODE and time.time() - step_toast_at < 3.5:
+                if step_song:
+                    step_msg = f"STEP: {step_song_title} ({len(step_song)}音)  [T:OFF / B:頭から / N,P:曲切替]"
+                else:
+                    step_msg = "STEP: songs/ に演奏できるMIDIがありません"
+                put_text_jp(image, step_msg, (50, 133), 15, (255, 150, 255), bg_color=(30, 30, 30))
+
+            # ステップ演奏中は、画面下端に曲の進み具合バーを表示
+            if STEP_MODE and step_song:
+                progress = step_cursor / len(step_song)
+                bar_color = rainbow_bgr(progress * 0.85) if RAINBOW_LANES else (255, 255, 255)
+                cv2.rectangle(image, (0, h - 6), (w, h), (40, 40, 40), -1)
+                cv2.rectangle(image, (0, h - 6), (int(w * progress), h), bar_color, -1)
+
             # 右上にSettingsボタンを描画
             draw_button(image, "Settings [Tab]", w - 140, 10, 130, 35, False, active_color=(0, 255, 0))
 
@@ -1193,7 +1387,8 @@ try:
                 strum_txt = "STRUM:ON" if STRUM_MODE else "STRUM:OFF"
                 auto_txt = "AUTO:ON" if AUTO_PLAY_ENABLED else "AUTO:OFF"
                 filter_txt = "FILTER:ON" if FILTER_MODE else "FILTER:OFF"
-                status_line = f"[{CURRENT_KEY}] | {wave_txt} | {filter_txt} | {strum_txt} | {auto_txt} | TH:{PINCH_THRESHOLD:.2f}"
+                step_txt = f"STEP:{step_cursor}/{len(step_song)}" if STEP_MODE else "STEP:OFF"
+                status_line = f"[{CURRENT_KEY}] | {wave_txt} | {filter_txt} | {strum_txt} | {step_txt} | {auto_txt} | TH:{PINCH_THRESHOLD:.2f}"
                 cv2.putText(image, status_line, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
 
                 # 手ごとの発音状況（H1 = MIDI ch1, H2 = ch2 ...）
@@ -1246,9 +1441,10 @@ try:
             # 自動演奏ソング選択コントロール (下段)
             cur_song_title = auto_player.get_current_title()
             put_text_jp(image, f"AutoSong: {cur_song_title}", (40, 358), 16, (255, 255, 255))
-            draw_button(image, "< Prev [P]", 40, 385, 120, 40, False, active_color=(0, 255, 255))
-            draw_button(image, "Next [N] >", 180, 385, 120, 40, False, active_color=(0, 255, 255))
-            draw_button(image, "Rescan songs/ [S]", 320, 385, 260, 40, False, active_color=(0, 200, 255))
+            draw_button(image, "< Prev [P]", 40, 385, 110, 40, False, active_color=(0, 255, 255))
+            draw_button(image, "Next [N] >", 165, 385, 110, 40, False, active_color=(0, 255, 255))
+            draw_button(image, "Rescan [S]", 290, 385, 130, 40, False, active_color=(0, 200, 255))
+            draw_button(image, f"STEP [T]: {'ON' if STEP_MODE else 'OFF'}", 435, 385, 145, 40, STEP_MODE, active_color=(255, 150, 255))
 
             # 指の狭さ（ピンチ判定しきい値）コントロール (最下段)
             now_txt = " ".join(f"H{i + 1}:{int(st['pinch'] * 100)}%" for i, st in enumerate(hand_states) if st['active']) or "-"
@@ -1283,7 +1479,9 @@ try:
                     anchor_color = (0, 0, 255) if SHOW_DEBUG else (255, 255, 255)
                     cv2.circle(image, (start_px_x, start_px_y), 8, anchor_color, -1)
 
-                if STRUM_MODE:
+                if STEP_MODE:
+                    is_active_sound = bool(state['step_notes'])
+                elif STRUM_MODE:
                     is_active_sound = bool(state['notes'])
                 else:
                     is_active_sound = state['note'] is not None
@@ -1294,7 +1492,11 @@ try:
                     cv2.circle(image, (idx_x, idx_y), 15, color, -1)
                     cv2.putText(image, f"Pinch:{pinch_pct}%", (idx_x + 20, idx_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
 
-                    if STRUM_MODE:
+                    if STEP_MODE:
+                        if state['step_notes']:
+                            notes_str = ", ".join([midi_to_note_name(n) for n in sorted(state['step_notes'])])
+                            cv2.putText(image, f"STEP: {notes_str}", (idx_x + 20, idx_y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 150, 255), 2)
+                    elif STRUM_MODE:
                         if state['notes']:
                             sorted_notes = sorted(list(state['notes']))
                             notes_str = ", ".join([midi_to_note_name(n) for n in sorted_notes])
@@ -1390,6 +1592,15 @@ try:
                 print(f"【設定変更】ピンチ判定しきい値: {PINCH_THRESHOLD:.2f}")
             elif key == ord('c'):
                 toggle_filter_mode()
+            elif key == ord('t'):
+                toggle_step_mode()
+            elif key == ord('b'):
+                # ステップ演奏を曲の頭から
+                for st in hand_states:
+                    stop_hand_notes(st)
+                step_cursor = 0
+                step_toast_at = time.time()
+                print("【ステップ演奏】曲の頭に戻りました")
             elif key == ord('o'):
                 # 内蔵シンセのオーディオ出力デバイスを順番に切り替え
                 if synth is not None:
