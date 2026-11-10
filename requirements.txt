@@ -1,0 +1,8 @@
+mediapipe
+opencv-python
+mido
+python-rtmidi
+numpy
+Pillow
+sounddevice
+scipy

@@ -1,16 +1,34 @@
-# ------------------------------------------------------------------
-# synth.py - tElemin 高音質・超低遅延ポリフォニック・ソフトウェアシンセサイザー
-#   sounddevice + numpy によるリアルタイムストリーミング合成
-#   波形: 無段階モーフィング (Sine ~ Triangle ~ Saw ~ Square ~ Theremin ~ Bell)
-#   音色操作: 波形モーフィング(RV1), 明るさCutoff(RV2), 余韻Release(RV3), マスター音量(RV4)
-# ------------------------------------------------------------------
-import numpy as np
-import sounddevice as sd
+# ==========================================
+# tElemin 内蔵シンセサイザー (synth.py)
+# ==========================================
+# Vital などの外部シンセを使わずに、Python 自身で高音質・超低遅延で音を合成し、
+# PC のオーディオ出力（イヤホン端子 / USB-DAC など）から直接鳴らします。
+#
+# 特徴:
+#   1. 波形無段階モーフィング: Sine ⇄ Triangle ⇄ Sawtooth ⇄ Square ⇄ Theremin ⇄ Bell
+#      アナログつまみ（RV1）で滑らかに音色が連続変化。
+#   2. オシロスコープHUDプレビュー: 画面右上に現在の合成波形をリアルタイム描画可能。
+#   3. 知覚マスター音量制御: オーディオテーパー（2乗カーブ）による自然な音量調整。
+#   4. チャンネル別音量 & フィルター (CC#74/CC#71): 手の傾き(FILTER_MODE)や連弾に対応。
+#   5. OutputHub: 内部シンセと外部MIDI出力ポートへの同時・透過的ルーティング。
+#   6. デバイス切り替え: 'o' キーでオーディオ出力先を瞬時に変更。
+# ==========================================
 import threading
+import numpy as np
 import time
 import math
 
-# 波形インデックス定数
+try:
+    import sounddevice as sd
+except ImportError:
+    sd = None
+
+try:
+    from scipy.signal import lfilter
+except ImportError:
+    lfilter = None
+
+# 波形定数
 WAVE_SINE = 0
 WAVE_TRIANGLE = 1
 WAVE_SAWTOOTH = 2
@@ -37,7 +55,7 @@ WAVE_SHORT_NAMES = [
 ]
 
 def midi_to_freq(note):
-    """MIDIノート番号（浮動小数点も可）を周波数(Hz)に変換"""
+    """MIDIノート番号（浮動小数点可）を周波数(Hz)に変換"""
     return 440.0 * (2.0 ** ((note - 69.0) / 12.0))
 
 def generate_single_waveform(wave_idx, phases):
@@ -45,23 +63,17 @@ def generate_single_waveform(wave_idx, phases):
     if wave_idx == WAVE_SINE:
         return np.sin(phases)
     elif wave_idx == WAVE_TRIANGLE:
-        # 三角波: -1.0 〜 +1.0
         return 2.0 * np.abs(2.0 * (phases / (2.0 * np.pi) - np.floor(phases / (2.0 * np.pi) + 0.5))) - 1.0
     elif wave_idx == WAVE_SAWTOOTH:
-        # ノコギリ波: -1.0 〜 +1.0
         return 2.0 * (phases / (2.0 * np.pi) - np.floor(phases / (2.0 * np.pi) + 0.5))
     elif wave_idx == WAVE_SQUARE:
-        # 矩形波
         return np.where(phases < np.pi, 0.75, -0.75)
     elif wave_idx == WAVE_THEREMIN:
-        # 真空管テルミン（基本波＋わずかな2次・3次倍音＋温かみサチュレーション）
         s_fund = np.sin(phases)
         s_h2 = 0.22 * np.sin(2.0 * phases)
         s_h3 = 0.10 * np.sin(3.0 * phases)
-        raw = s_fund + s_h2 + s_h3
-        return np.tanh(raw * 1.3) * 0.85
+        return np.tanh((s_fund + s_h2 + s_h3) * 1.3) * 0.85
     elif wave_idx == WAVE_BELL:
-        # ベル/プラック（基音＋非調和倍音）
         s1 = np.sin(phases)
         s2 = 0.4 * np.sin(phases * 2.76)
         s3 = 0.2 * np.sin(phases * 5.40)
@@ -69,9 +81,7 @@ def generate_single_waveform(wave_idx, phases):
     return np.sin(phases)
 
 def generate_morphed_waveform(morph_pos, phases):
-    """波形の滑らかな連続モーフィング（無段階クロスフェード補間）
-    morph_pos: 0.0 (Sine) 〜 1.0 (Triangle) 〜 2.0 (Saw) 〜 3.0 (Square) 〜 4.0 (Theremin) 〜 5.0 (Bell)
-    """
+    """波形の滑らかな連続モーフィング（無段階クロスフェード補間）"""
     max_idx = len(WAVE_NAMES) - 1
     m = max(0.0, min(float(max_idx), float(morph_pos)))
     idx0 = int(math.floor(m))
@@ -86,7 +96,7 @@ def generate_morphed_waveform(morph_pos, phases):
     return w0 * (1.0 - frac) + w1 * frac
 
 def get_morph_description(morph_pos):
-    """現在の波形モーフィング位置の文字列表現"""
+    """波形モーフィング位置の文字列表現"""
     max_idx = len(WAVE_NAMES) - 1
     m = max(0.0, min(float(max_idx), float(morph_pos)))
     idx0 = int(math.floor(m))
@@ -102,95 +112,111 @@ def get_morph_description(morph_pos):
         return f"{WAVE_SHORT_NAMES[idx0]} → {WAVE_SHORT_NAMES[idx1]} ({pct}%)"
 
 
-class Voice:
-    """単一の発音ボイス"""
-    def __init__(self, voice_id, sample_rate=44100):
-        self.voice_id = voice_id
-        self.sample_rate = sample_rate
-        self.active = False
-        self.target_freq = 440.0
-        self.current_freq = 440.0
-        self.phase = 0.0
-        self.velocity = 0.8
-        self.gate = False
-        self.channel = 0
-        self.note = 60
-        self.age = 0.0
+class _Voice:
+    __slots__ = ('note', 'channel', 'velocity', 'phase', 'current_freq', 'target_freq', 'env_val', 'env_state', 'held', 'age')
 
-        # ADSR (秒)
-        self.attack_time = 0.015
-        self.decay_time = 0.1
-        self.sustain_level = 0.85
-        self.release_time = 0.08
-
-        # 状態: 0=OFF, 1=ATTACK, 2=DECAY, 3=SUSTAIN, 4=RELEASE
-        self.env_state = 0
-        self.env_val = 0.0
-
-    def note_on(self, freq, velocity, channel=0, note=60):
-        self.target_freq = freq
-        if not self.active:
-            self.current_freq = freq
-            self.phase = 0.0
-            self.env_val = 0.0
-        self.velocity = max(0.05, min(1.0, float(velocity) / 127.0 if velocity > 1.0 else float(velocity)))
-        self.channel = channel
+    def __init__(self, note, channel, velocity, age, freq):
         self.note = note
-        self.gate = True
-        self.active = True
-        self.env_state = 1  # ATTACK
-        self.age = 0.0
-
-    def set_freq(self, freq):
-        """テルミンの手の動きによる連続ピッチ変更"""
+        self.channel = channel
+        self.velocity = velocity
+        self.phase = 0.0
+        self.current_freq = freq
         self.target_freq = freq
+        self.env_val = 0.0
+        self.env_state = 1  # 1=ATTACK, 2=DECAY, 3=SUSTAIN, 4=RELEASE
+        self.held = True
+        self.age = age
 
-    def note_off(self):
-        self.gate = False
-        self.env_state = 4  # RELEASE
 
+class SoftSynth:
+    """高音質・超低遅延ポリフォニック・ソフトウェアシンセサイザー"""
+    MAX_VOICES = 24
+    ATTACK_SEC = 0.012
+    DEFAULT_RELEASE_SEC = 0.12
+    MASTER_GAIN = 0.85
+    VIBRATO_HZ = 5.5
 
-class InternalSynth:
-    """ポリフォニック・ソフトウェアシンセサイザー (無段階波形モーフィング対応)"""
-    def __init__(self, sample_rate=44100, blocksize=256, max_voices=24):
-        self.sample_rate = sample_rate
+    CUTOFF_MIN_HZ = 180.0
+    CUTOFF_MAX_HZ = 14000.0
+    CUTOFF_SMOOTH = 0.35
+
+    def __init__(self, device=None, blocksize=256, samplerate=44100):
         self.blocksize = blocksize
-        self.max_voices = max_voices
+        self.samplerate = samplerate
+        self.lock = threading.Lock()
+        self.voices = {}  # (channel, note) -> _Voice
+        self._age = 0
+
+        # 音色・マスターパラメータ
         self.waveform_morph = 4.0   # 0.0〜5.0 (初期値: Vintage Theremin)
         self.master_volume = 0.80   # 0.0〜1.0 (初期値: 80%)
-        self.cutoff = 1.0          # 0.05〜1.0 (音の明るさ / LPF)
-        self.release_time = 0.08   # 0.02〜1.2秒 (余韻)
-        self.pan = 0.5             # 0.0 (左) 〜 1.0 (右)
+        self.cutoff = 1.0          # グローバルCutoff (0.05〜1.0)
+        self.release_time = self.DEFAULT_RELEASE_SEC
+        self.pan = 0.5
         self.enabled = True
 
-        self.voices = [Voice(i, sample_rate) for i in range(max_voices)]
-        self.lock = threading.Lock()
+        # チャンネル別パラメータ (16ch)
+        self.ch_volume = [1.0] * 16
+        self._ch_volume_now = list(self.ch_volume)
+        self.ch_wave = [self.waveform_morph] * 16
+        self.ch_bend = [0.0] * 16
+        self.ch_mod = [0.0] * 16
+        self.ch_cutoff = [1.0] * 16
+        self._ch_cutoff_now = [1.0] * 16
+        self.ch_reso = [0.0] * 16
+        self._filter_zi = [np.zeros(2) for _ in range(16)]
+        self._filter_coef = [None] * 16
 
-        # ハンド追跡用ボイス辞書 (slot_index -> voice)
-        self.hand_voices = {}
-
-        # 連続時間
+        self._vib_phase = 0.0
         self.time_sec = 0.0
-
-        # sounddevice 出力ストリーム
+        self.device = device
+        self.device_name = "Default"
         self.stream = None
-        self._start_stream()
+
+        if sd is not None:
+            self._start_stream()
 
     def _start_stream(self):
+        if sd is None:
+            return
         try:
             self.stream = sd.OutputStream(
-                samplerate=self.sample_rate,
+                samplerate=self.samplerate,
                 blocksize=self.blocksize,
                 channels=2,
                 dtype='float32',
                 callback=self._audio_callback,
+                device=self.device,
                 latency='low'
             )
             self.stream.start()
-            print(f"[InternalSynth] 内蔵シンセサイザー開始 (SR: {self.sample_rate}Hz, Buffer: {self.blocksize})")
+            dev_info = sd.query_devices(self.device, 'output') if self.device is not None else sd.query_devices(kind='output')
+            self.device_name = dev_info['name']
+            self.samplerate = int(self.stream.samplerate)
+            print(f"[SoftSynth] 開始: {self.device_name} ({self.samplerate}Hz, Buffer: {self.blocksize})")
         except Exception as e:
-            print(f"[InternalSynth] オーディオデバイス初期化エラー: {e}")
+            print(f"[SoftSynth] オーディオデバイス初期化エラー: {e}")
             self.stream = None
+
+    def cycle_device(self):
+        """オーディオ出力デバイスを次の候補へ切り替える ('o' キー)"""
+        if sd is None:
+            return "No sounddevice"
+        try:
+            devs = [i for i, d in enumerate(sd.query_devices()) if d['max_output_channels'] > 0]
+            if not devs:
+                return "No output device"
+            cur_idx = devs.index(self.device) if self.device in devs else -1
+            next_dev = devs[(cur_idx + 1) % len(devs)]
+            self.close()
+            self.device = next_dev
+            self._start_stream()
+            return self.device_name
+        except Exception as e:
+            return f"Error: {e}"
+
+    def get_device_name(self):
+        return self.device_name
 
     def close(self):
         if self.stream is not None:
@@ -202,6 +228,44 @@ class InternalSynth:
             self.stream = None
 
     # ==========================================
+    #  MIDI メッセージ受信インターフェース (send)
+    # ==========================================
+    def send(self, msg):
+        """mido.Message を受け取ってシンセを直接駆動"""
+        if msg.type == 'note_on':
+            if msg.velocity > 0:
+                self.note_on(msg.note, msg.velocity, channel=getattr(msg, 'channel', 0))
+            else:
+                self.note_off(msg.note, channel=getattr(msg, 'channel', 0))
+        elif msg.type == 'note_off':
+            self.note_off(msg.note, channel=getattr(msg, 'channel', 0))
+        elif msg.type == 'pitchwheel':
+            ch = getattr(msg, 'channel', 0)
+            with self.lock:
+                self.ch_bend[ch] = (msg.pitch / 8192.0) * 2.0
+        elif msg.type == 'control_change':
+            ch = getattr(msg, 'channel', 0)
+            if msg.control == 1:  # モジュレーション (ビブラート)
+                with self.lock:
+                    self.ch_mod[ch] = msg.value / 127.0
+            elif msg.control == 7:  # チャンネル音量
+                with self.lock:
+                    self.ch_volume[ch] = msg.value / 127.0
+            elif msg.control == 16:  # CC16 波形
+                self.set_waveform_by_midi(msg.value)
+            elif msg.control == 74:  # フィルターカットオフ
+                with self.lock:
+                    self.ch_cutoff[ch] = msg.value / 127.0
+                    self.cutoff = self.ch_cutoff[ch]
+            elif msg.control == 71:  # レゾナンス
+                with self.lock:
+                    self.ch_reso[ch] = msg.value / 127.0
+            elif msg.control == 73:  # リリース
+                self.set_release_time(msg.value)
+            elif msg.control in (120, 123):  # All Notes Off
+                self.all_notes_off()
+
+    # ==========================================
     #  音色パラメータ制御 API
     # ==========================================
     def set_waveform_morph(self, val):
@@ -211,42 +275,42 @@ class InternalSynth:
                 self.waveform_morph = max(0.0, min(5.0, (float(val) / 127.0) * 5.0))
             else:
                 self.waveform_morph = max(0.0, min(5.0, float(val)))
+            for ch in range(16):
+                self.ch_wave[ch] = self.waveform_morph
             return get_morph_description(self.waveform_morph)
 
     def set_waveform_by_midi(self, midi_val):
-        """MIDIつまみ値 (0〜127) から波形を無段階モーフィング"""
         return self.set_waveform_morph(midi_val)
 
     def set_waveform(self, wave_type):
-        """ステップ切り替え (互換性用)"""
         with self.lock:
             self.waveform_morph = float(max(0, min(5, int(wave_type))))
+            for ch in range(16):
+                self.ch_wave[ch] = self.waveform_morph
             return get_morph_description(self.waveform_morph)
 
     def next_waveform(self):
-        """次の基本波形へステップ進める"""
         with self.lock:
             cur_idx = int(round(self.waveform_morph))
             next_idx = (cur_idx + 1) % len(WAVE_NAMES)
             self.waveform_morph = float(next_idx)
+            for ch in range(16):
+                self.ch_wave[ch] = self.waveform_morph
             return get_morph_description(self.waveform_morph)
 
     def get_waveform_name(self):
-        """現在の波形名を取得"""
         with self.lock:
             return get_morph_description(self.waveform_morph)
 
-    def get_waveform_preview(self, num_samples=100):
+    def get_waveform_preview(self, num_samples=70):
         """画面右上HUDプレビュー描画用の波形配列 (-1.0〜1.0) を生成"""
         with self.lock:
             morph = self.waveform_morph
             cutoff_val = self.cutoff
 
-        # 1.5周期分 (0 〜 3π) の位相
         phases = np.linspace(0, 3.0 * np.pi, num_samples, endpoint=False, dtype=np.float32)
         wave = generate_morphed_waveform(morph, phases)
 
-        # Cutoffフィルターの視覚的反映
         if cutoff_val < 0.95:
             k_size = int((1.0 - cutoff_val) * 8.0) + 1
             if k_size > 1:
@@ -266,13 +330,16 @@ class InternalSynth:
             return int(round(self.master_volume * 100))
 
     def set_cutoff(self, val):
-        """フィルターカットオフ / 音の明るさ (0.0〜1.0 または 0〜127)"""
+        """フィルターカットオフ (0.0〜1.0 または 0〜127)"""
         with self.lock:
             if isinstance(val, (int, np.integer)) or val > 1.0:
-                self.cutoff = max(0.05, min(1.0, float(val) / 127.0))
+                norm = max(0.05, min(1.0, float(val) / 127.0))
             else:
-                self.cutoff = max(0.05, min(1.0, float(val)))
-            return int(round(self.cutoff * 100))
+                norm = max(0.05, min(1.0, float(val)))
+            self.cutoff = norm
+            for ch in range(16):
+                self.ch_cutoff[ch] = norm
+            return int(round(norm * 100))
 
     def set_release_time(self, val):
         """余韻・リリース時間 (0.02秒〜1.2秒)"""
@@ -281,10 +348,7 @@ class InternalSynth:
                 norm = max(0.0, min(1.0, float(val) / 127.0))
             else:
                 norm = max(0.0, min(1.0, float(val)))
-            # 指数カーブで 0.02秒 〜 1.2秒
             self.release_time = 0.02 + (norm ** 2) * 1.18
-            for v in self.voices:
-                v.release_time = self.release_time
             return round(self.release_time, 2)
 
     def set_pan(self, val):
@@ -298,178 +362,245 @@ class InternalSynth:
     #  ノート発音・制御 API
     # ==========================================
     def note_on(self, note, velocity=100, channel=0):
-        """MIDIノート番号で発音"""
         freq = midi_to_freq(note)
+        vel = max(0.05, min(1.0, float(velocity) / 127.0 if velocity > 1.0 else float(velocity)))
+        key = (channel, note)
         with self.lock:
-            # 既に同じ (channel, note) を鳴らしているボイスがあれば再トリガー
-            for v in self.voices:
-                if v.active and v.channel == channel and v.note == note:
-                    v.release_time = self.release_time
-                    v.note_on(freq, velocity, channel, note)
-                    return
+            self._age += 1
+            if key in self.voices:
+                v = self.voices[key]
+                v.velocity = vel
+                v.target_freq = freq
+                v.held = True
+                v.env_state = 1
+                v.age = self._age
+                return
 
-            # 空いているボイスを探す
-            for v in self.voices:
-                if not v.active:
-                    v.release_time = self.release_time
-                    v.note_on(freq, velocity, channel, note)
-                    return
+            if len(self.voices) >= self.MAX_VOICES:
+                oldest_key = min(self.voices, key=lambda k: (self.voices[k].held, self.voices[k].age))
+                del self.voices[oldest_key]
 
-            # 空きが無ければ最も古いリリース中または古いボイスを奪う
-            oldest_v = min(self.voices, key=lambda x: (x.env_state != 4, x.age))
-            oldest_v.release_time = self.release_time
-            oldest_v.note_on(freq, velocity, channel, note)
+            self.voices[key] = _Voice(note, channel, vel, self._age, freq)
 
     def note_off(self, note, channel=0):
-        """MIDIノート番号で消音"""
+        key = (channel, note)
         with self.lock:
-            for v in self.voices:
-                if v.active and v.channel == channel and v.note == note:
-                    v.note_off()
+            if key in self.voices:
+                v = self.voices[key]
+                v.held = False
+                v.env_state = 4  # RELEASE
 
     def all_notes_off(self):
-        """全音消音"""
         with self.lock:
-            for v in self.voices:
-                if v.active:
-                    v.note_off()
-            self.hand_voices.clear()
+            for v in self.voices.values():
+                v.held = False
+                v.env_state = 4
 
-    # ==========================================
-    #  テルミン専用ハンド追従 API
-    # ==========================================
+    # テルミン直接追従用
     def set_hand_pitch(self, slot_idx, freq_or_note, velocity=0.85):
-        """テルミンの手の動きによる連続ピッチ発音・追従"""
+        note = int(round(freq_or_note)) if freq_or_note < 130 else 60
         freq = midi_to_freq(freq_or_note) if freq_or_note < 130 else freq_or_note
+        key = (slot_idx, note)
         with self.lock:
-            if slot_idx in self.hand_voices:
-                v = self.hand_voices[slot_idx]
-                if v.active and v.env_state != 4:
-                    v.set_freq(freq)
-                    v.velocity = max(0.1, min(1.0, velocity))
-                    return
-
-            # 新規割り当て
-            for v in self.voices:
-                if not v.active:
-                    v.release_time = self.release_time
-                    v.note_on(freq, velocity, channel=slot_idx, note=int(round(freq_or_note)))
-                    self.hand_voices[slot_idx] = v
-                    return
-
-            oldest_v = min(self.voices, key=lambda x: (x.env_state != 4, x.age))
-            oldest_v.release_time = self.release_time
-            oldest_v.note_on(freq, velocity, channel=slot_idx, note=int(round(freq_or_note)))
-            self.hand_voices[slot_idx] = oldest_v
+            if key in self.voices:
+                v = self.voices[key]
+                v.target_freq = freq
+                v.velocity = max(0.1, min(1.0, velocity))
+            else:
+                self.note_on(note, int(velocity * 127), channel=slot_idx)
 
     def release_hand(self, slot_idx):
-        """手が画面外に出た/離れたときの消音"""
         with self.lock:
-            if slot_idx in self.hand_voices:
-                v = self.hand_voices.pop(slot_idx)
-                v.note_off()
+            to_release = [k for k in self.voices if k[0] == slot_idx]
+            for k in to_release:
+                self.voices[k].held = False
+                self.voices[k].env_state = 4
 
     # ==========================================
-    #  リアルタイム波形合成コールバック (sounddevice)
+    #  オーディオ合成コールバック
     # ==========================================
     def _audio_callback(self, outdata, frames, time_info, status):
         if not self.enabled:
             outdata.fill(0)
             return
 
-        dt = 1.0 / self.sample_rate
+        dt = 1.0 / self.samplerate
         sample_times = np.arange(frames, dtype=np.float32) * dt
-        mixed_buffer = np.zeros(frames, dtype=np.float32)
+        k = np.arange(frames, dtype=np.float32)
+        sr = float(self.samplerate)
 
         with self.lock:
             morph_pos = self.waveform_morph
             master_vol = self.master_volume
-            cutoff_val = self.cutoff
             pan = self.pan
 
-            for v in self.voices:
-                if not v.active:
-                    continue
+            # LFO (ビブラート)
+            lfo = np.sin(2.0 * np.pi * (self._vib_phase + k * (self.VIBRATO_HZ / sr)))
+            self._vib_phase = (self._vib_phase + frames * (self.VIBRATO_HZ / sr)) % 1.0
 
+            # チャンネル音量スムージング
+            vol_ramp = []
+            for ch in range(16):
+                target = self.ch_volume[ch]
+                start = self._ch_volume_now[ch]
+                self._ch_volume_now[ch] = target
+                vol_ramp.append(np.linspace(start, target, frames, endpoint=False, dtype=np.float32))
+
+            ch_mix = {}
+            dead = []
+
+            for key, v in list(self.voices.items()):
+                ch = v.channel
                 v.age += frames * dt
 
-                # ポルタメント（周波数スムーズ追従）
-                smooth_factor = 0.15
-                target_f = v.target_freq
-                cur_f = v.current_freq + (target_f - v.current_freq) * smooth_factor
-                v.current_freq = cur_f
+                # ポルタメント
+                v.current_freq += (v.target_freq - v.current_freq) * 0.15
+                semis = (v.current_freq - 440.0) / 440.0 * 12.0 if v.current_freq > 0 else 0.0
+                semis += self.ch_bend[ch]
 
-                # 位相アレイ生成
-                d_phase = 2.0 * np.pi * cur_f * dt
-                phases = (v.phase + np.arange(frames, dtype=np.float32) * d_phase) % (2.0 * np.pi)
-                v.phase = (v.phase + frames * d_phase) % (2.0 * np.pi)
+                freq = v.current_freq * (2.0 ** (self.ch_bend[ch] / 12.0))
+                inc = freq / sr
+                mod = self.ch_mod[ch]
 
-                # 滑らかな連続モーフィング波形の合成
-                sample = generate_morphed_waveform(morph_pos, phases)
+                if mod > 0:
+                    inc_arr = inc * (1.0 + 0.012 * mod * lfo)
+                    phases = (v.phase + np.cumsum(inc_arr) * (2.0 * np.pi)) % (2.0 * np.pi)
+                    v.phase = phases[-1]
+                else:
+                    d_phase = 2.0 * np.pi * inc
+                    phases = (v.phase + k * d_phase) % (2.0 * np.pi)
+                    v.phase = (v.phase + frames * d_phase) % (2.0 * np.pi)
 
-                # ベル成分が混ざっている場合は自然な減衰をブレンド
-                if morph_pos > 4.0:
-                    bell_weight = morph_pos - 4.0
+                # 波形合成
+                ch_morph = self.ch_wave[ch]
+                sample = generate_morphed_waveform(ch_morph, phases)
+                if ch_morph > 4.0:
+                    bell_weight = ch_morph - 4.0
                     decay = np.exp(-v.age * 3.5)
                     sample = sample * (1.0 - bell_weight + bell_weight * decay)
 
-                # ADSR エンベロープ計算
+                # ADSR エンベロープ
                 env = np.empty(frames, dtype=np.float32)
+                rel_time = max(0.02, self.release_time)
+                att_step = 1.0 / (self.ATTACK_SEC * sr)
+                rel_step = 1.0 / (rel_time * sr)
+
                 for i in range(frames):
                     if v.env_state == 1:  # ATTACK
-                        v.env_val += (1.0 / (v.attack_time * self.sample_rate))
+                        v.env_val += att_step
                         if v.env_val >= 1.0:
                             v.env_val = 1.0
-                            v.env_state = 2  # DECAY
-                    elif v.env_state == 2:  # DECAY
-                        v.env_val -= ((1.0 - v.sustain_level) / (v.decay_time * self.sample_rate))
-                        if v.env_val <= v.sustain_level:
-                            v.env_val = v.sustain_level
                             v.env_state = 3  # SUSTAIN
                     elif v.env_state == 3:  # SUSTAIN
-                        v.env_val = v.sustain_level
+                        if not v.held:
+                            v.env_state = 4  # RELEASE
                     elif v.env_state == 4:  # RELEASE
-                        v.env_val -= (v.sustain_level / (v.release_time * self.sample_rate))
+                        v.env_val -= rel_step
                         if v.env_val <= 0.0:
                             v.env_val = 0.0
-                            v.env_state = 0
-                            v.active = False
+                            dead.append(key)
                             break
                     else:
                         v.env_val = 0.0
-                        v.active = False
+                        dead.append(key)
                         break
                     env[i] = v.env_val
 
-                if v.active:
-                    mixed_buffer += sample * env * v.velocity
+                if v.env_val > 0.0:
+                    voice_out = sample * env * v.velocity * vol_ramp[ch]
+                    if ch in ch_mix:
+                        ch_mix[ch] += voice_out
+                    else:
+                        ch_mix[ch] = voice_out
+
+            for key in dead:
+                self.voices.pop(key, None)
 
             self.time_sec += frames * dt
 
-        # ------------------------------------------
-        # 音の明るさ (Cutoff Low-Pass フィルター)
-        # ------------------------------------------
-        if cutoff_val < 0.95:
-            k_size = int((1.0 - cutoff_val) * 8.0) + 1
-            if k_size > 1:
-                kernel = np.ones(k_size, dtype=np.float32) / k_size
-                filtered = np.convolve(mixed_buffer, kernel, mode='same')
-                blend = 1.0 - cutoff_val
-                mixed_buffer = mixed_buffer * (1.0 - blend) + filtered * blend
+        # チャンネル別フィルター
+        mixed_total = np.zeros(frames, dtype=np.float32)
+        for ch in range(16):
+            if ch not in ch_mix:
+                self._filter_zi[ch][:] = 0.0
+                self._ch_cutoff_now[ch] = self.ch_cutoff[ch]
+                continue
+            mixed_total += self._apply_filter(ch, ch_mix[ch])
 
-        # ------------------------------------------
-        # 出力リミッター ＆ マスターボリューム
-        # ------------------------------------------
-        # 1. まずソフトクリッピング（音割れ防止）
-        limited = np.tanh(mixed_buffer * 0.85)
+        # リミッター ＆ 知覚マスターボリューム (2乗カーブ)
+        limited = np.tanh(mixed_total * self.MASTER_GAIN)
+        output_mono = limited * (master_vol ** 2)
 
-        # 2. マスターボリューム適用（知覚音量に合わせた2乗カーブ）
-        vol_gain = (master_vol ** 2)
-        output_mono = limited * vol_gain
-
-        # ステレオパンニング
         left_gain = math.cos(pan * math.pi * 0.5)
         right_gain = math.sin(pan * math.pi * 0.5)
 
         outdata[:, 0] = output_mono * left_gain
         outdata[:, 1] = output_mono * right_gain
+
+    def _apply_filter(self, ch, x):
+        """ローパスフィルター (scipy RBJフィルター または移動平均)"""
+        cutoff_val = self.ch_cutoff[ch]
+        if lfilter is not None:
+            now = self._ch_cutoff_now[ch]
+            now += (cutoff_val - now) * self.CUTOFF_SMOOTH
+            self._ch_cutoff_now[ch] = now
+            reso = self.ch_reso[ch]
+            if now >= 0.999 and reso <= 0.001:
+                self._filter_zi[ch][:] = 0.0
+                return x
+
+            cached = self._filter_coef[ch]
+            if cached is None or abs(cached[0] - now) > 1e-4 or cached[1] != reso:
+                fc = self.CUTOFF_MIN_HZ * (self.CUTOFF_MAX_HZ / self.CUTOFF_MIN_HZ) ** now
+                fc = min(fc, self.samplerate * 0.45)
+                q = 0.707 + reso * 7.0
+                w0 = 2.0 * np.pi * fc / self.samplerate
+                alpha = np.sin(w0) / (2.0 * q)
+                cos_w0 = np.cos(w0)
+                a0 = 1.0 + alpha
+                b = np.array([(1.0 - cos_w0) / 2.0, 1.0 - cos_w0, (1.0 - cos_w0) / 2.0]) / a0
+                a = np.array([1.0, -2.0 * cos_w0 / a0, (1.0 - alpha) / a0])
+                cached = (now, reso, b, a)
+                self._filter_coef[ch] = cached
+
+            y, self._filter_zi[ch] = lfilter(cached[2], cached[3], x, zi=self._filter_zi[ch])
+            return y
+        else:
+            if cutoff_val < 0.95:
+                k_size = int((1.0 - cutoff_val) * 8.0) + 1
+                if k_size > 1:
+                    kernel = np.ones(k_size, dtype=np.float32) / k_size
+                    filtered = np.convolve(x, kernel, mode='same')
+                    blend = 1.0 - cutoff_val
+                    return x * (1.0 - blend) + filtered * blend
+            return x
+
+
+class OutputHub:
+    """複数の出力先（内蔵シンセ / MIDIポート）へ同じMIDIメッセージを配るハブ"""
+    def __init__(self, outputs):
+        self.outputs = list(outputs)
+
+    def send(self, msg):
+        for o in self.outputs:
+            try:
+                o.send(msg)
+            except Exception as e:
+                pass
+
+    def cycle_device(self):
+        for o in self.outputs:
+            if hasattr(o, 'cycle_device'):
+                return o.cycle_device()
+        return "N/A"
+
+    def close(self):
+        for o in self.outputs:
+            try:
+                o.close()
+            except Exception:
+                pass
+
+
+# 互換エイリアス
+InternalSynth = SoftSynth
