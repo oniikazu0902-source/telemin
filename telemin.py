@@ -82,6 +82,21 @@
 #     release_hand() でステップの音も止まります。モード切替時は stop_hand_notes() で全スロットを消音。
 #   - 虹レーンは、つまんでいる間「手の高さのレーン」を光らせます。演奏画面の下端に曲の進み具合バー。
 #   - 設定画面の下段（曲選択の行）を Prev / Next / Rescan / STEP の4つに詰めました。
+#
+# Claude へ（Gemini より 2026-11-10）:
+#   ステップ演奏モードとフィルターモードの追加ありがとうございます！
+#   こちらの作業ブランチで進めていた以下の機能を完全統合（マージ）しました：
+#   1. 物理MIDIコントローラー対応（Raspberry Pi Pico / 実験基板）：
+#      - ボタン8個（SW1〜SW8）：スケール切替、和音ON/OFF、ストラムON/OFF、オクターブ切替、自動演奏ON/OFF、次曲、前曲、虹色レーン切替。
+#      - つまみ4個（RV1〜RV4）：波形モーフィング(CC#74)、音の明るさ(CC#71)、余韻(CC#73)、マスター音量(CC#7)。
+#      - 操作時にHUDトースト通知（show_toast）で画面左上に大きくフィードバック。
+#   2. 波形無段階モーフィング ＆ 波形プレビューHUD：
+#      - 階段状の波形切替を撤廃し、Sine ⇄ Triangle ⇄ Sawtooth ⇄ Square ⇄ Theremin ⇄ Bell の間を角度に応じて滑らかに無段階ブレンド。
+#      - 画面右上（Settingsボタン直下）に現在の合成波形をリアルタイム描画するオシロスコープHUDを新設。
+#   3. 音量つまみ修正 ＆ OutputHub 統合：
+#      - MIDI曲内のCC#7でマスター音量が勝手に上書きされないよう分離し、リミッター後の知覚音量（2乗カーブ）に修正。
+#      - Claude が実装した SoftSynth / OutputHub と Gemini の InternalSynth を synth.py で完全統合。
+#        outport.send() で Claude の STEP_MODE も外部MIDI/内部シンセ両方で問題なく鳴ります。
 # ------------------------------------------------------------------
 import cv2
 import numpy as np
@@ -91,6 +106,7 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import mido
+import synth
 import threading
 import time
 import os
@@ -99,6 +115,36 @@ from synth import SoftSynth, OutputHub
 
 # どこから起動しても hand_landmarker.task や songs/ を見つけられるよう、スクリプトの場所を基準にする
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+# 内部ソフトウェアシンセサイザーの起動 (超低遅延ストリーミング)
+try:
+    internal_synth = synth.InternalSynth(sample_rate=44100, blocksize=256)
+except Exception as e:
+    print(f"[WARNING] 内部シンセサイザーの初期化に失敗しました: {e}")
+    internal_synth = None
+
+def send_midi(msg):
+    """内部シンセサイザーへの直接発音・制御"""
+    if internal_synth is None:
+        return
+    try:
+        if msg.type == 'note_on':
+            if msg.velocity > 0:
+                internal_synth.note_on(msg.note, msg.velocity, channel=getattr(msg, 'channel', 0))
+            else:
+                internal_synth.note_off(msg.note, channel=getattr(msg, 'channel', 0))
+        elif msg.type == 'note_off':
+            internal_synth.note_off(msg.note, channel=getattr(msg, 'channel', 0))
+        elif msg.type == 'control_change':
+            if msg.control == 123:  # All Notes Off
+                internal_synth.all_notes_off()
+            elif msg.control == 10:  # Pan
+                internal_synth.set_pan(msg.value)
+            # 注意: CC 7 (Volume), CC 74 (Waveform), CC 71 (Cutoff), CC 73 (Release) は
+            # 物理コントローラー専用のマスター操作とするため、MIDI曲データによる勝手な上書きを防止
+    except Exception:
+        pass
+
 
 # =======
 # 和音や音階リストを定義する配列
@@ -116,6 +162,17 @@ KEY_PRESETS = {
     'Miyakobushi': [50, 51, 55, 57, 58, 62, 63, 67, 69, 70, 74, 75]  # 都節音階（和風: D, Eb, G, A, Bb...）
 }
 CURRENT_KEY = 'C_major'
+GLOBAL_OCTAVE_SHIFT = 0  # オクターブシフト (-1, 0, +1)
+
+# HUDトースト通知用
+toast_text = ""
+toast_expire = 0.0
+
+def show_toast(text, duration=3.0):
+    global toast_text, toast_expire
+    toast_text = text
+    toast_expire = time.time() + duration
+    print(text)
 
 # HUDメニュー表示用定義
 SCALE_MENU_ITEMS = [
@@ -127,6 +184,26 @@ SCALE_MENU_ITEMS = [
     ('6', 'Miyakobushi', 'Miyakobushi (都節音階)'),
     ('7', 'D_major', 'D Major (カノン/ニ長調)')
 ]
+
+SCALE_KEYS = [item[1] for item in SCALE_MENU_ITEMS]
+SCALE_NAME_MAP = {item[1]: item[2] for item in SCALE_MENU_ITEMS}
+
+def cycle_scale():
+    global CURRENT_KEY
+    cur_idx = SCALE_KEYS.index(CURRENT_KEY) if CURRENT_KEY in SCALE_KEYS else 0
+    CURRENT_KEY = SCALE_KEYS[(cur_idx + 1) % len(SCALE_KEYS)]
+    show_toast(f"【設定変更/SW1】音階: {SCALE_NAME_MAP[CURRENT_KEY]}")
+
+def cycle_octave():
+    global GLOBAL_OCTAVE_SHIFT
+    if GLOBAL_OCTAVE_SHIFT == 0:
+        GLOBAL_OCTAVE_SHIFT = 1
+    elif GLOBAL_OCTAVE_SHIFT == 1:
+        GLOBAL_OCTAVE_SHIFT = -1
+    else:
+        GLOBAL_OCTAVE_SHIFT = 0
+    sign = f"+{GLOBAL_OCTAVE_SHIFT}" if GLOBAL_OCTAVE_SHIFT > 0 else f"{GLOBAL_OCTAVE_SHIFT}"
+    show_toast(f"【設定変更/SW4】オクターブ: {sign} Oct")
 
 # =======
 # 検出範囲・モードの設定
@@ -155,6 +232,7 @@ MIDI_OUT_PORT = 'Default Basic App Loopback 1'
 
 # 波形変化モードのデフォルト状態
 WAVE_MODE = False
+waveform_changed_at = 0.0  # 波形切り替えトースト表示用タイマー
 
 # フィルターモード（手の傾きで音の明るさ = Filter Cutoff CC#74 を操作）。'c' キーで切り替え
 # 手を外側（右手は右、左手は左）へ傾けるほど明るく、内側へ傾けるほどこもった音になる
@@ -320,6 +398,55 @@ def draw_button(img, text, x, y, w, h, is_active, active_color=(255, 255, 0), in
     cv2.putText(img, text, (text_x, text_y), font, font_scale, text_color, text_thickness)
 
 # ==========================================
+# 波形オシロスコープHUDプレビュー描画ヘルパー
+# ==========================================
+def draw_waveform_preview(img, x, y, w=180, h=75):
+    """画面右上に現在の音色・合成波形をプレビュー表示するオシロスコープHUD"""
+    if internal_synth is None:
+        return
+
+    ih, iw = img.shape[:2]
+    if x + w > iw or y + h > ih or x < 0 or y < 0:
+        return
+
+    # 1. 半透明ダーク背景
+    roi = img[y:y+h, x:x+w]
+    dark_bg = np.full_like(roi, (20, 24, 30))
+    cv2.addWeighted(dark_bg, 0.82, roi, 0.18, 0, roi)
+    img[y:y+h, x:x+w] = roi
+
+    # 枠線 (サイバーブルー)
+    cv2.rectangle(img, (x, y), (x + w, y + h), (180, 140, 40), 1)
+
+    # 2. グリッド線（ゼロクロス中心線）
+    center_y = y + h // 2
+    cv2.line(img, (x + 6, center_y), (x + w - 6, center_y), (60, 70, 80), 1)
+
+    # 3. 波形プレビュー配列の取得 (70サンプル)
+    wave_samples = internal_synth.get_waveform_preview(num_samples=70)
+
+    # 座標マッピング
+    draw_w = w - 16
+    draw_h = (h - 28) // 2
+    pts = []
+    for i, s in enumerate(wave_samples):
+        px = int(x + 8 + (i / max(1, len(wave_samples) - 1)) * draw_w)
+        py = int(center_y - s * draw_h * 0.90)
+        pts.append([px, py])
+
+    if len(pts) > 1:
+        pts_arr = np.array(pts, np.int32).reshape((-1, 1, 2))
+        # ネオンイエロー/シアン (BGR: 255, 230, 0)
+        cv2.polylines(img, [pts_arr], isClosed=False, color=(255, 230, 0), thickness=2, lineType=cv2.LINE_AA)
+
+    # 4. タイトル
+    cv2.putText(img, "WAVE PREVIEW", (x + 8, y + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (160, 190, 220), 1, cv2.LINE_AA)
+
+    # 現在の波形モーフィング名
+    wave_title = internal_synth.get_waveform_name()
+    put_text_jp(img, wave_title, (x + 8, y + h - 18), 11, (220, 245, 255))
+
+# ==========================================
 # 虹色ヘルパー関数
 # ==========================================
 def rainbow_bgr(pos, offset=0.0):
@@ -441,8 +568,7 @@ def extract_hand_features(hand_landmarks, aspect=1.0):
 MIDI_DIR = "songs"
 
 class AutoPlayer:
-    def __init__(self, outport, midi_dir=MIDI_DIR):
-        self.outport = outport
+    def __init__(self, midi_dir=MIDI_DIR):
         self.midi_dir = midi_dir
         self.running = False
         self.paused = True
@@ -563,7 +689,7 @@ class AutoPlayer:
 
     def _all_notes_off(self):
         for ch in range(16):
-            self.outport.send(mido.Message('control_change', control=123, value=0, channel=ch))
+            send_midi(mido.Message('control_change', control=123, value=0, channel=ch))
 
     def pause(self):
         with self.lock:
@@ -583,7 +709,7 @@ class AutoPlayer:
                 self.title_changed_at = time.time()
                 # チャンネルの音量CC#7を100に確実にリセット
                 for ch in range(16):
-                    self.outport.send(mido.Message('control_change', control=7, value=100, channel=ch))
+                    send_midi(mido.Message('control_change', control=7, value=100, channel=ch))
                 print(f"【自動演奏】再開: {self.get_current_title()}")
 
     def stop(self):
@@ -623,7 +749,7 @@ class AutoPlayer:
 
                     # 再生開始時に音量を健全な値（100）にリセット
                     for ch in range(16):
-                        self.outport.send(mido.Message('control_change', control=7, value=100, channel=ch))
+                        send_midi(mido.Message('control_change', control=7, value=100, channel=ch))
 
                     # 発音中ノートを追跡（ポリフォニー制限＆音の濁り防止）
                     active_notes = {}  # (ch, note) -> timestamp
@@ -671,23 +797,23 @@ class AutoPlayer:
 
                                 # 同音連打時は先に消音
                                 if key in active_notes:
-                                    self.outport.send(mido.Message('note_off', note=msg.note, channel=msg.channel))
+                                    send_midi(mido.Message('note_off', note=msg.note, channel=msg.channel))
                                     del active_notes[key]
 
                                 # ポリフォニー上限チェック（音が濁るのを防ぐため最も古い音を消音）
                                 if len(active_notes) >= MAX_POLYPHONY:
                                     oldest_key = min(active_notes, key=active_notes.get)
-                                    self.outport.send(mido.Message('note_off', note=oldest_key[1], channel=oldest_key[0]))
+                                    send_midi(mido.Message('note_off', note=oldest_key[1], channel=oldest_key[0]))
                                     del active_notes[oldest_key]
 
                                 # ベロシティを適切な音量帯(55〜110)にノーマライズ
                                 vel = max(55, min(110, msg.velocity))
-                                self.outport.send(mido.Message('note_on', note=msg.note, velocity=vel, channel=msg.channel))
+                                send_midi(mido.Message('note_on', note=msg.note, velocity=vel, channel=msg.channel))
                                 active_notes[key] = time.time()
 
                         elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
                             key = (msg.channel, msg.note)
-                            self.outport.send(mido.Message('note_off', note=msg.note, channel=msg.channel))
+                            send_midi(mido.Message('note_off', note=msg.note, channel=msg.channel))
                             active_notes.pop(key, None)
 
                     # 曲が自然終了した場合は次の曲へ自動で進む
@@ -718,34 +844,20 @@ options = vision.HandLandmarkerOptions(
 )
 detector = vision.HandLandmarker.create_from_options(options)
 
-# ==========================================
-# 2. MIDI出力・入力ポートを開く
-# ==========================================
 # 出力先は「内蔵シンセ（PCのオーディオ出力から直接発音）」と「MIDI出力ポート（Vital等）」の2系統。
-# 両方とも OutputHub にまとめ、以降のコードは outport.send() するだけで両方に届く。
+# 両方とも OutputHub にまとめ、以降のコードは outport.send() / send_midi() するだけで届く。
 outputs = []
 
 # (1) 内蔵シンセ: PCのヘッドホン端子 / USB-DAC などから直接音を出す（Vital不要）
 synth = None
-if USE_INTERNAL_SYNTH:
-    synth = SoftSynth(device=AUDIO_DEVICE)
+try:
+    synth = SoftSynth()
     outputs.append(synth)
-
-# (2) MIDI出力ポート（Vital等の外部シンセ用）。見つからなくても内蔵シンセだけで動作する
-if USE_MIDI_OUT:
-    try:
-        outputs.append(mido.open_output(MIDI_OUT_PORT))
-        print(f"MIDI出力ポート '{MIDI_OUT_PORT}' を開きました。")
-    except OSError:
-        print(f"MIDI出力ポート '{MIDI_OUT_PORT}' が見つかりません（内蔵シンセのみで発音します）。")
-
-if not outputs:
-    print("出力先がありません。USE_INTERNAL_SYNTH か USE_MIDI_OUT を True にしてください。")
-    exit()
+    internal_synth = synth  # 内部シンセ参照を共通化
+except Exception as e:
+    print(f"[WARNING] 内蔵シンセサイザーの初期化に失敗しました: {e}")
 
 outport = OutputHub(outputs)
-
-# 入力ポート (MIDIコントローラーからPythonへの入力 ＆ スルー転送用)
 inport = None
 input_ports = mido.get_input_names()
 print("--- 利用可能なMIDI入力ポート ---")
@@ -753,23 +865,35 @@ for port in input_ports:
     print(f" - {port}")
 print("--------------------------------")
 
+# 1. Pico / tElemin コントローラーを最優先で接続
 for port in input_ports:
-    # 仮想ループバックポートは除外し、物理コントローラーらしきものを自動選択
-    if "Loopback" not in port and "loopMIDI" not in port:
+    if any(kw in port.lower() for kw in ["pico", "telemin", "arduino", "controller"]):
         try:
             inport = mido.open_input(port)
-            print(f"MIDI入力コントローラーとして '{port}' を開きました。（内蔵シンセ / MIDI出力で発音）")
+            print(f"★ 物理MIDIコントローラーとして '{port}' を接続しました！")
             break
-        except OSError:
-            pass
+        except Exception as e:
+            print(f"ポート '{port}' のオープンに失敗: {e}")
+
+# 2. なければ他の物理コントローラーを探索
+if inport is None:
+    for port in input_ports:
+        if "loopback" not in port.lower() and "loopmidi" not in port.lower():
+            try:
+                inport = mido.open_input(port)
+                print(f"MIDI入力コントローラーとして '{port}' を開きました。")
+                break
+            except Exception:
+                pass
 
 if inport is None:
-    print("物理MIDIコントローラーは接続されていません（テルミン演奏機能のみで動作します）。")
+    print("物理MIDIコントローラーは未接続です（テルミン演奏機能のみで動作します）。")
+
 
 # ==========================================
-# 3. 自動演奏スレッドの始動
+# 3. 自動演奏スレッドの始動 (内部シンセ直接演奏)
 # ==========================================
-auto_player = AutoPlayer(outport)
+auto_player = AutoPlayer()
 auto_player.start()
 
 # ==========================================
@@ -831,10 +955,10 @@ hand_states = [new_hand_state(i) for i in range(MAX_HANDS)]
 def stop_hand_notes(state):
     """そのスロットで鳴っている音（通常・和音・ステップ）をすべて止める。手の追跡状態はそのまま"""
     if state['note'] is not None:
-        outport.send(mido.Message('note_off', note=state['note'], channel=state['channel']))
+        send_midi(mido.Message('note_off', note=state['note'], channel=state['channel']))
         state['note'] = None
     for n in state['notes'] | state['step_notes']:
-        outport.send(mido.Message('note_off', note=n, channel=state['channel']))
+        send_midi(mido.Message('note_off', note=n, channel=state['channel']))
     state['notes'] = set()
     state['step_notes'] = set()
     state['step_pinched'] = False
@@ -1005,13 +1129,14 @@ try:
                     print("【切替】都節音階 (Miyakobushi) になりました")
 
                 # モードトグルボタン
-                elif is_in_rect(mouse_x, mouse_y, 40, 250, 160, 45):
-                    WAVE_MODE = not WAVE_MODE
-                    print(f"【切替】波形モードが {'ON' if WAVE_MODE else 'OFF'} になりました")
-                elif is_in_rect(mouse_x, mouse_y, 220, 250, 160, 45):
+                elif is_in_rect(mouse_x, mouse_y, 40, 250, 320, 45):
+                    if internal_synth is not None:
+                        internal_synth.next_waveform()
+                        waveform_changed_at = time.time()
+                elif is_in_rect(mouse_x, mouse_y, 380, 250, 140, 45):
                     STRUM_MODE = not STRUM_MODE
                     print(f"【切替】和音モードが {'ON' if STRUM_MODE else 'OFF'} になりました")
-                elif is_in_rect(mouse_x, mouse_y, 400, 250, 160, 45):
+                elif is_in_rect(mouse_x, mouse_y, 535, 250, 140, 45):
                     AUTO_PLAY_ENABLED = not AUTO_PLAY_ENABLED
                     print(f"【切替】自動演奏機能が {'ON' if AUTO_PLAY_ENABLED else 'OFF'} になりました")
                     if not AUTO_PLAY_ENABLED:
@@ -1047,11 +1172,82 @@ try:
 
 
         # ------------------------------------
-        # MIDIコントローラーからの入力をVitalへスルー転送
+        # MIDIコントローラーからの入力を処理 (ボタン=設定変更, つまみ=音色変更)
         # ------------------------------------
         if inport is not None:
             for msg in inport.iter_pending():
-                outport.send(msg)
+                if msg.type == 'control_change':
+                    # つまみ4つの音色変更
+                    if msg.control == 74 or msg.control == 14:  # RV1: 波形選択
+                        if internal_synth:
+                            w_name = internal_synth.set_waveform_by_midi(msg.value)
+                            show_toast(f"【音色/RV1】波形: {w_name}")
+                    elif msg.control == 71 or msg.control == 1:   # RV2: 音の明るさ(Cutoff)
+                        if internal_synth:
+                            pct = internal_synth.set_cutoff(msg.value)
+                            show_toast(f"【音色/RV2】音の明るさ: {pct}%")
+                    elif msg.control == 73 or msg.control == 2:   # RV3: 余韻(Release)
+                        if internal_synth:
+                            sec = internal_synth.set_release_time(msg.value)
+                            show_toast(f"【音色/RV3】余韻(Release): {sec}秒")
+                    elif msg.control == 7:                        # RV4: マスター音量
+                        if internal_synth:
+                            vol = internal_synth.set_master_volume(msg.value)
+                            show_toast(f"【音色/RV4】音量: {vol}%")
+
+                    # ボタン8つの設定変更 (CC 20〜27)
+                    elif msg.control == 20:  # SW1: スケール切替
+                        cycle_scale()
+                    elif msg.control == 21:  # SW2: 和音モード切替
+                        CHORD_MODE = not CHORD_MODE
+                        show_toast(f"【設定変更/SW2】和音モード: {'ON' if CHORD_MODE else 'OFF'}")
+                    elif msg.control == 22:  # SW3: ストラム演奏切替
+                        STRUM_MODE = not STRUM_MODE
+                        show_toast(f"【設定変更/SW3】ストラム奏法: {'ON' if STRUM_MODE else 'OFF'}")
+                    elif msg.control == 23:  # SW4: オクターブ切替
+                        cycle_octave()
+                    elif msg.control == 24:  # SW5: 自動演奏 ON/OFF
+                        AUTO_PLAY_ENABLED = not AUTO_PLAY_ENABLED
+                        if not AUTO_PLAY_ENABLED:
+                            auto_player.pause()
+                        show_toast(f"【設定変更/SW5】自動演奏: {'ON' if AUTO_PLAY_ENABLED else 'OFF'}")
+                    elif msg.control == 25:  # SW6: 次の曲
+                        auto_player.next_song()
+                        show_toast(f"【設定変更/SW6】次曲: {auto_player.get_current_title()}")
+                    elif msg.control == 26:  # SW7: 前の曲
+                        auto_player.prev_song()
+                        show_toast(f"【設定変更/SW7】前曲: {auto_player.get_current_title()}")
+                    elif msg.control == 27:  # SW8: レインボー切替
+                        RAINBOW_LANES = not RAINBOW_LANES
+                        show_toast(f"【設定変更/SW8】虹色レーン: {'ON' if RAINBOW_LANES else 'OFF'}")
+
+                elif msg.type == 'note_on' and msg.velocity > 0:
+                    # Note仕様(60〜67)でもボタン設定切り替えとして完全対応
+                    btn_idx = msg.note - 60
+                    if btn_idx == 0:   # SW1: スケール切替
+                        cycle_scale()
+                    elif btn_idx == 1: # SW2: 和音モード切替
+                        CHORD_MODE = not CHORD_MODE
+                        show_toast(f"【設定変更/SW2】和音モード: {'ON' if CHORD_MODE else 'OFF'}")
+                    elif btn_idx == 2: # SW3: ストラム演奏切替
+                        STRUM_MODE = not STRUM_MODE
+                        show_toast(f"【設定変更/SW3】ストラム奏法: {'ON' if STRUM_MODE else 'OFF'}")
+                    elif btn_idx == 3: # SW4: オクターブ切替
+                        cycle_octave()
+                    elif btn_idx == 4: # SW5: 自動演奏 ON/OFF
+                        AUTO_PLAY_ENABLED = not AUTO_PLAY_ENABLED
+                        if not AUTO_PLAY_ENABLED:
+                            auto_player.pause()
+                        show_toast(f"【設定変更/SW5】自動演奏: {'ON' if AUTO_PLAY_ENABLED else 'OFF'}")
+                    elif btn_idx == 5: # SW6: 次の曲
+                        auto_player.next_song()
+                        show_toast(f"【設定変更/SW6】次曲: {auto_player.get_current_title()}")
+                    elif btn_idx == 6: # SW7: 前の曲
+                        auto_player.prev_song()
+                        show_toast(f"【設定変更/SW7】前曲: {auto_player.get_current_title()}")
+                    elif btn_idx == 7: # SW8: レインボー切替
+                        RAINBOW_LANES = not RAINBOW_LANES
+                        show_toast(f"【設定変更/SW8】虹色レーン: {'ON' if RAINBOW_LANES else 'OFF'}")
 
         # ------------------------------------
         # 手の位置から音程を計算してMIDI送信
@@ -1099,7 +1295,8 @@ try:
                 else:
                     note = int((1.0 - y_scaled_final) * 24) + 60
 
-                note = max(0, min(127, note))
+                # オクターブシフト適用
+                note = max(0, min(127, note + GLOBAL_OCTAVE_SHIFT * 12))
 
                 # 【機能追加】左手の場合は1オクターブ下げるロジック
                 if hand_type == 'Left':
@@ -1112,11 +1309,11 @@ try:
                 x_cc_value = int(features['index_x'] * 127)
                 x_cc_value = max(0, min(127, x_cc_value))
 
-                outport.send(mido.Message('control_change', control=7, value=cc_value, channel=state['channel']))
+                send_midi(mido.Message('control_change', control=7, value=cc_value, channel=state['channel']))
 
                 # WAVE_MODEがTrueのときのみX座標（CC#16）を送信
                 if WAVE_MODE:
-                    outport.send(mido.Message('control_change', control=16, value=x_cc_value, channel=state['channel']))
+                    send_midi(mido.Message('control_change', control=16, value=x_cc_value, channel=state['channel']))
 
                 # FILTER_MODEがTrueのときのみ、手の傾きで Filter Cutoff（CC#74）を送信
                 if FILTER_MODE:
@@ -1194,13 +1391,13 @@ try:
                             step = 1 if idx_start <= idx_current else -1
                             target_notes = set()
                             for i in range(idx_start, idx_current + step, step):
-                                n = ALLOWED_NOTES[i]
+                                n = ALLOWED_NOTES[i] + GLOBAL_OCTAVE_SHIFT * 12
                                 if hand_type == 'Left':
                                     n = max(0, n - 12)
-                                target_notes.add(n)
+                                target_notes.add(max(0, min(127, n)))
                         else:
                             # クロマチック（半音階）の場合の範囲
-                            note_start = int((1.0 - y_start_scaled) * 24) + 60
+                            note_start = int((1.0 - y_start_scaled) * 24) + 60 + GLOBAL_OCTAVE_SHIFT * 12
                             note_start = max(0, min(127, note_start))
                             if hand_type == 'Left':
                                 note_start = max(0, note_start - 12)
@@ -1219,13 +1416,13 @@ try:
                         # 新しく発音すべきノートを note_on
                         for n in target_notes:
                             if n not in state['notes']:
-                                outport.send(mido.Message('note_on', note=n, velocity=velocity, channel=state['channel']))
+                                send_midi(mido.Message('note_on', note=n, velocity=velocity, channel=state['channel']))
                                 print(f"【MIDI送信】[和音] Note ON: {n} ({midi_to_note_name(n)}) - ベロシティ: {velocity}")
 
                         # 範囲から外れたノートを note_off
                         for n in list(state['notes']):
                             if n not in target_notes:
-                                outport.send(mido.Message('note_off', note=n, channel=state['channel']))
+                                send_midi(mido.Message('note_off', note=n, channel=state['channel']))
                                 print(f"【MIDI送信】[和音] Note OFF: {n} ({midi_to_note_name(n)})")
 
                         # 発音中ノートリストを更新
@@ -1235,7 +1432,7 @@ try:
                         # 指を離した場合は全消音
                         if state['notes']:
                             for n in state['notes']:
-                                outport.send(mido.Message('note_off', note=n, channel=state['channel']))
+                                send_midi(mido.Message('note_off', note=n, channel=state['channel']))
                                 print(f"【MIDI送信】[和音全消音] Note OFF: {n} ({midi_to_note_name(n)})")
                             state['notes'].clear()
                         state['pinch_start_x'] = None
@@ -1247,24 +1444,24 @@ try:
                     # ------------------------------------
                     if state['notes']:
                         for n in state['notes']:
-                            outport.send(mido.Message('note_off', note=n, channel=state['channel']))
+                            send_midi(mido.Message('note_off', note=n, channel=state['channel']))
                         state['notes'].clear()
                     state['pinch_start_x'] = None
                     state['pinch_start_y'] = None
 
                     if is_pinching:
                         if state['note'] is None:
-                            outport.send(mido.Message('note_on', note=note, velocity=100, channel=state['channel']))
+                            send_midi(mido.Message('note_on', note=note, velocity=100, channel=state['channel']))
                             state['note'] = note
                         elif state['note'] != note:
                             old_note = state['note']
                             # 先に新しい音を鳴らしてから古い音を止めることで、シンセのレガート・ポルタメント（滑らかなスライド）を有効にします
-                            outport.send(mido.Message('note_on', note=note, velocity=100, channel=state['channel']))
-                            outport.send(mido.Message('note_off', note=old_note, channel=state['channel']))
+                            send_midi(mido.Message('note_on', note=note, velocity=100, channel=state['channel']))
+                            send_midi(mido.Message('note_off', note=old_note, channel=state['channel']))
                             state['note'] = note
                     else:
                         if state['note'] is not None:
-                            outport.send(mido.Message('note_off', note=state['note'], channel=state['channel']))
+                            send_midi(mido.Message('note_off', note=state['note'], channel=state['channel']))
                             state['note'] = None
 
         # ------------------------------------
@@ -1365,10 +1562,19 @@ try:
             cv2.line(image, (0, int(h * Y_MIN_LIMIT)), (w, int(h * Y_MIN_LIMIT)), bound_color, bound_thick)
             cv2.line(image, (0, int(h * Y_MAX_LIMIT)), (w, int(h * Y_MAX_LIMIT)), bound_color, bound_thick)
 
-            # 自動演奏曲ステータス表示（曲変更後3.5秒間のみトースト表示し、演奏画面に文字が残り続けないようにする）
-            if time.time() - auto_player.title_changed_at < 3.5:
+            # コントローラー/キー操作によるトースト表示 (最優先表示)
+            if time.time() < toast_expire and toast_text:
+                put_text_jp(image, toast_text, (50, 48), 18, (0, 255, 255), bg_color=(20, 20, 20))
+            elif time.time() - auto_player.title_changed_at < 3.5:
                 cur_song_title = auto_player.get_current_title()
-                put_text_jp(image, f"AutoSong: {cur_song_title}  [N:Next / P:Prev / S:Scan]", (50, 103), 15, (0, 255, 255), bg_color=(30, 30, 30))
+                put_text_jp(image, f"AutoSong: {cur_song_title}  [N:Next / P:Prev / S:Scan]", (50, 48), 15, (0, 255, 255), bg_color=(30, 30, 30))
+
+            # 演奏画面の左上に常時小さく現在のステータス（音色＆設定）を表示
+            if internal_synth is not None:
+                wave_title = internal_synth.get_waveform_name()
+                oct_str = f"Oct:{'+' if GLOBAL_OCTAVE_SHIFT > 0 else ''}{GLOBAL_OCTAVE_SHIFT}" if GLOBAL_OCTAVE_SHIFT != 0 else ""
+                hud_status = f"Voice:{wave_title} | Cutoff:{int(internal_synth.cutoff*100)}% | Rel:{internal_synth.release_time:.2f}s | Vol:{int(internal_synth.master_volume*100)}% {oct_str}"
+                put_text_jp(image, hud_status, (10, 10), 13, (180, 240, 180), bg_color=(25, 25, 25))
 
             # ステップ演奏の曲名トースト（ON にしたとき・曲が変わったときだけ数秒表示）
             if STEP_MODE and time.time() - step_toast_at < 3.5:
@@ -1387,6 +1593,9 @@ try:
 
             # 右上にSettingsボタンを描画
             draw_button(image, "Settings [Tab]", w - 140, 10, 130, 35, False, active_color=(0, 255, 0))
+
+            # 右上に現在の合成波形プレビュー（オシロスコープHUD）を描画
+            draw_waveform_preview(image, w - 190, 52, 180, 75)
 
             # ------------------------------------
             # デバッグ表示（SHOW_DEBUG が True のときのみ）
@@ -1424,9 +1633,12 @@ try:
             # 中央上にタイトル
             cv2.putText(image, "tElemin Settings", (220, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-            # 内蔵シンセの出力先（デバイス名は日本語の場合があるので put_text_jp）
-            audio_txt = synth.device_name if synth is not None else "OFF"
+            # 内蔵シンセの出力先
+            audio_txt = internal_synth.get_device_name() if internal_synth is not None else "OFF"
             put_text_jp(image, f"Audio Out [O]: {audio_txt}", (40, 52), 14, (180, 255, 180))
+
+            # 右上に現在の合成波形プレビュー
+            draw_waveform_preview(image, w - 195, 10, 185, 75)
 
             # スケール選択ボタン (左列 1〜3)
             draw_button(image, "1. C Major", 40, 80, 250, 40, CURRENT_KEY == 'C_major')
@@ -1439,9 +1651,10 @@ try:
             draw_button(image, "6. Miyakobushi Scale", 320, 190, 280, 40, CURRENT_KEY == 'Miyakobushi')
 
             # モード切替トグルボタン (上段)
-            draw_button(image, f"WAVE: {'ON' if WAVE_MODE else 'OFF'}", 40, 250, 160, 45, WAVE_MODE)
-            draw_button(image, f"STRUM: {'ON' if STRUM_MODE else 'OFF'}", 220, 250, 160, 45, STRUM_MODE)
-            draw_button(image, f"AUTO: {'ON' if AUTO_PLAY_ENABLED else 'OFF'}", 400, 250, 160, 45, AUTO_PLAY_ENABLED)
+            wave_name = internal_synth.get_waveform_name() if internal_synth else "Default"
+            draw_button(image, f"VOICE [W]: {wave_name}", 40, 250, 320, 45, True, active_color=(0, 255, 255))
+            draw_button(image, f"STRUM: {'ON' if STRUM_MODE else 'OFF'}", 380, 250, 140, 45, STRUM_MODE)
+            draw_button(image, f"AUTO: {'ON' if AUTO_PLAY_ENABLED else 'OFF'}", 535, 250, 140, 45, AUTO_PLAY_ENABLED)
 
             # 追加トグルボタン (中段)
             draw_button(image, f"DEBUG: {'ON' if SHOW_DEBUG else 'OFF'}", 40, 310, 160, 40, SHOW_DEBUG)
@@ -1456,11 +1669,19 @@ try:
             draw_button(image, "Rescan [S]", 290, 385, 130, 40, False, active_color=(0, 200, 255))
             draw_button(image, f"STEP [T]: {'ON' if STEP_MODE else 'OFF'}", 435, 385, 145, 40, STEP_MODE, active_color=(255, 150, 255))
 
-            # 指の狭さ（ピンチ判定しきい値）コントロール (最下段)
+            # 指の狭さ（ピンチ判定しきい値）コントロール (下段)
             now_txt = " ".join(f"H{i + 1}:{int(st['pinch'] * 100)}%" for i, st in enumerate(hand_states) if st['active']) or "-"
             put_text_jp(image, f"Pinch Threshold: {PINCH_THRESHOLD:.2f} (Now {now_txt})", (40, 442), 15, (255, 255, 255))
             draw_button(image, "[-] Down", 320, 435, 120, 38, False, active_color=(255, 200, 0))
             draw_button(image, "[+] Up", 460, 435, 120, 38, False, active_color=(255, 200, 0))
+
+            # MIDIコントローラー操作ガイド表示 (最下段)
+            guide_y = 485
+            put_text_jp(image, "【MIDIコントローラー機能割当】", (40, guide_y), 15, (0, 255, 200))
+            btn_guide = "ボタン: SW1:音階 | SW2:和音 | SW3:ストラム | SW4:オクターブ | SW5:自動演奏 | SW6/7:曲送り戻し | SW8:虹色"
+            knob_guide = "つまみ: RV1:波形選択 | RV2:音の明るさ(Cutoff) | RV3:余韻(Release) | RV4:音量(Volume)"
+            put_text_jp(image, btn_guide, (40, guide_y + 24), 13, (220, 220, 220))
+            put_text_jp(image, knob_guide, (40, guide_y + 44), 13, (220, 220, 220))
 
         # ------------------------------------
         # 手の描画処理（演奏画面のときのみ表示）
@@ -1549,80 +1770,85 @@ try:
                 break
             elif key == ord('1'):
                 CURRENT_KEY = 'C_major'
-                print("【切替】ハ長調 (C Major) になりました")
+                show_toast("【音階切替】ハ長調 (C Major)")
             elif key == ord('2'):
                 CURRENT_KEY = 'A_minor'
-                print("【切替】イ短調 (A Minor) になりました")
+                show_toast("【音階切替】イ短調 (A Minor)")
             elif key == ord('3'):
                 CURRENT_KEY = 'G_major'
-                print("【切替】ト長調 (G Major) になりました")
+                show_toast("【音階切替】ト長調 (G Major)")
             elif key == ord('4'):
                 CURRENT_KEY = 'A_pentatonic_minor'
-                print("【切替】ペンタトニック・マイナー (A Pentatonic Minor) になりました")
+                show_toast("【音階切替】ペンタトニック・マイナー")
             elif key == ord('5'):
                 CURRENT_KEY = 'Ryukyu'
-                print("【切替】琉球音階 (Ryukyu) になりました")
+                show_toast("【音階切替】琉球音階 (Ryukyu)")
             elif key == ord('6'):
                 CURRENT_KEY = 'Miyakobushi'
-                print("【切替】都節音階 (Miyakobushi) になりました")
+                show_toast("【音階切替】都節音階 (Miyakobushi)")
             elif key == ord('7'):
                 CURRENT_KEY = 'D_major'
-                print("【切替】ニ長調 / カノンの調 (D Major) になりました")
+                show_toast("【音階切替】ニ長調 (D Major / カノン)")
             elif key == ord('w'):
-                WAVE_MODE = not WAVE_MODE
-                print(f"【切替】波形モードが {'ON' if WAVE_MODE else 'OFF'} になりました")
+                if internal_synth is not None:
+                    internal_synth.next_waveform()
+                    show_toast(f"【波形切替】{internal_synth.get_waveform_name()}")
+                else:
+                    WAVE_MODE = not WAVE_MODE
+                    show_toast(f"【切替】波形モード: {'ON' if WAVE_MODE else 'OFF'}")
+            elif key == ord('o'):
+                cycle_octave()
             elif key == ord('h'):
                 STRUM_MODE = not STRUM_MODE
-                print(f"【切替】和音モードが {'ON' if STRUM_MODE else 'OFF'} になりました")
+                show_toast(f"【切替】和音ストラム奏法: {'ON' if STRUM_MODE else 'OFF'}")
             elif key == ord('m'):
                 AUTO_PLAY_ENABLED = not AUTO_PLAY_ENABLED
-                auto_player.title_changed_at = time.time()
-                print(f"【切替】自動演奏機能が {'ON' if AUTO_PLAY_ENABLED else 'OFF'} になりました")
                 if not AUTO_PLAY_ENABLED:
                     auto_player.pause()
+                show_toast(f"【切替】自動演奏機能: {'ON' if AUTO_PLAY_ENABLED else 'OFF'}")
             elif key == ord('d'):
                 SHOW_DEBUG = not SHOW_DEBUG
-                print(f"【切替】デバッグ表示が {'ON' if SHOW_DEBUG else 'OFF'} になりました")
+                show_toast(f"【切替】デバッグ表示: {'ON' if SHOW_DEBUG else 'OFF'}")
             elif key == ord('r'):
                 RAINBOW_LANES = not RAINBOW_LANES
-                print(f"【切替】虹色レーンが {'ON' if RAINBOW_LANES else 'OFF'} になりました")
+                show_toast(f"【切替】虹色レーン: {'ON' if RAINBOW_LANES else 'OFF'}")
             elif key == ord('n') or key == ord('['):
                 auto_player.next_song()
+                show_toast(f"【次曲】{auto_player.get_current_title()}")
             elif key == ord('p') or key == ord(']'):
                 auto_player.prev_song()
+                show_toast(f"【前曲】{auto_player.get_current_title()}")
             elif key == ord('s'):
                 auto_player.scan_songs()
+                show_toast("【曲スキャン】songs/ を再スキャンしました")
             elif key == ord('-') or key == ord('_'):
                 PINCH_THRESHOLD = round(max(0.20, PINCH_THRESHOLD - 0.05), 2)
-                auto_player.title_changed_at = time.time()
-                print(f"【設定変更】ピンチ判定しきい値: {PINCH_THRESHOLD:.2f}")
+                show_toast(f"【感度調整】ピンチしきい値: {PINCH_THRESHOLD:.2f}")
             elif key == ord('=') or key == ord('+'):
                 PINCH_THRESHOLD = round(min(0.95, PINCH_THRESHOLD + 0.05), 2)
-                auto_player.title_changed_at = time.time()
-                print(f"【設定変更】ピンチ判定しきい値: {PINCH_THRESHOLD:.2f}")
+                show_toast(f"【感度調整】ピンチしきい値: {PINCH_THRESHOLD:.2f}")
             elif key == ord('c'):
                 toggle_filter_mode()
             elif key == ord('t'):
                 toggle_step_mode()
             elif key == ord('b'):
-                # ステップ演奏を曲の頭から
                 for st in hand_states:
                     stop_hand_notes(st)
                 step_cursor = 0
                 step_toast_at = time.time()
-                print("【ステップ演奏】曲の頭に戻りました")
+                show_toast("【ステップ演奏】曲の頭に戻りました")
             elif key == ord('o'):
-                # 内蔵シンセのオーディオ出力デバイスを順番に切り替え
-                if synth is not None:
-                    synth.next_device()
+                if internal_synth is not None:
+                    dev_name = internal_synth.cycle_device()
+                    show_toast(f"【音声出力】{dev_name}")
             elif key == ord('f'):
                 FULLSCREEN = not FULLSCREEN
                 apply_window_mode('Theremin Camera', FULLSCREEN)
-                print(f"【切替】全画面表示が {'ON' if FULLSCREEN else 'OFF'} になりました")
+                show_toast(f"【全画面表示】{'ON' if FULLSCREEN else 'OFF'}")
 
             elif key == 9:  # Tabキーのキーコード (9)
                 UI_STATE = 'SETTINGS' if UI_STATE == 'PLAY' else 'PLAY'
-                print(f"【画面切替】画面を {UI_STATE} モードに切り替えました")
+                show_toast(f"【画面切替】{UI_STATE} モード")
 
 except KeyboardInterrupt:
     pass
@@ -1640,11 +1866,11 @@ finally:
     for state in hand_states:
         release_hand(state)
 
-    # 全チャンネル消音信号送信
-    for ch in range(16):
-        outport.send(mido.Message('control_change', control=123, value=0, channel=ch))
+    # 内部シンセサイザーの完全停止
+    if internal_synth is not None:
+        internal_synth.all_notes_off()
+        internal_synth.close()
 
-    outport.close()
     if inport is not None:
         inport.close()
     detector.close()

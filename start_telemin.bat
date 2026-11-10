@@ -2,30 +2,11 @@
 :: Move to this script's folder so it works from shortcuts / other directories
 cd /d "%~dp0"
 echo ==========================================
-echo  tElemin Launcher
+echo  tElemin Launcher (Internal Synthesizer)
 echo ==========================================
 
-:: 1. Launch Vital (optional)
-:: tElemin now has a built-in synth (synth.py) that plays through the PC audio output,
-:: so Vital is not required. Set LAUNCH_VITAL=1 to also start Vital.
-set LAUNCH_VITAL=0
-set VITAL_PATH="C:\Program Files\Vital\Vital.exe"
-
-if "%LAUNCH_VITAL%"=="1" (
-    if exist %VITAL_PATH% (
-        echo [1/3] Launching Vital...
-        start "" %VITAL_PATH%
-        echo [2/3] Waiting 2 seconds for MIDI port...
-        timeout /t 2 /nobreak > nul
-    ) else (
-        echo [WARNING] Vital.exe was not found at %VITAL_PATH%
-    )
-) else (
-    echo [1/3] Using built-in synth - Vital is not launched.
-)
-
-:: 2. Activate Python Virtual Environment
-echo [3/3] Activating virtual environment and running tElemin...
+:: 1. Activate Python Virtual Environment
+echo [1/2] Activating Python virtual environment...
 
 if exist ".venv\Scripts\activate.bat" (
     call .venv\Scripts\activate.bat
@@ -35,7 +16,8 @@ if exist ".venv\Scripts\activate.bat" (
     echo [WARNING] Virtual environment not found. Trying default system Python.
 )
 
-:: 3. Run Script
+:: 2. Run Script
+echo [2/2] Starting tElemin...
 python telemin.py
 
 echo.
