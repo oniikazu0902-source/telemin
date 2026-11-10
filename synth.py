@@ -59,25 +59,36 @@ def midi_to_freq(note):
     return 440.0 * (2.0 ** ((note - 69.0) / 12.0))
 
 def generate_single_waveform(wave_idx, phases):
-    """単一の基本波形を位相アレイ (0〜2π) から生成"""
+    """単一の基本波形を位相アレイ (0〜2π) から生成
+    各波形の倍音エネルギーやRMS（実効値）特性に応じた知覚音量均一化ゲイン（ラウドネス補正）を適用し、
+    矩形波やノコギリ波に切り替えても全体の音量が一定になるよう振幅を自動調整します。
+    """
     if wave_idx == WAVE_SINE:
-        return np.sin(phases)
+        # 正弦波: 基音のみ（知覚音量の基準）
+        return np.sin(phases) * 1.00
     elif wave_idx == WAVE_TRIANGLE:
-        return 2.0 * np.abs(2.0 * (phases / (2.0 * np.pi) - np.floor(phases / (2.0 * np.pi) + 0.5))) - 1.0
+        # 三角波: 基音成分がやや小さいため微小ブースト (1.05)
+        tri = 2.0 * np.abs(2.0 * (phases / (2.0 * np.pi) - np.floor(phases / (2.0 * np.pi) + 0.5))) - 1.0
+        return tri * 1.05
     elif wave_idx == WAVE_SAWTOOTH:
-        return 2.0 * (phases / (2.0 * np.pi) - np.floor(phases / (2.0 * np.pi) + 0.5))
+        # ノコギリ波: 全倍音が豊富で刺激的なため、振幅を0.60に抑えて知覚音量を一致
+        saw = 2.0 * (phases / (2.0 * np.pi) - np.floor(phases / (2.0 * np.pi) + 0.5))
+        return saw * 0.60
     elif wave_idx == WAVE_SQUARE:
-        return np.where(phases < np.pi, 0.75, -0.75)
+        # 矩形波: 実効値(RMS)が最大かつ強力な奇数次倍音を含むため、振幅を0.46に抑制
+        return np.where(phases < np.pi, 0.46, -0.46)
     elif wave_idx == WAVE_THEREMIN:
+        # 真空管テルミン: 2次・3次倍音とソフトサチュレーション
         s_fund = np.sin(phases)
         s_h2 = 0.22 * np.sin(2.0 * phases)
         s_h3 = 0.10 * np.sin(3.0 * phases)
-        return np.tanh((s_fund + s_h2 + s_h3) * 1.3) * 0.85
+        return np.tanh((s_fund + s_h2 + s_h3) * 1.3) * 0.78
     elif wave_idx == WAVE_BELL:
+        # ベル/プラック: 非調和金属倍音
         s1 = np.sin(phases)
         s2 = 0.4 * np.sin(phases * 2.76)
         s3 = 0.2 * np.sin(phases * 5.40)
-        return (s1 + s2 + s3) * 0.65
+        return (s1 + s2 + s3) * 0.48
     return np.sin(phases)
 
 def generate_morphed_waveform(morph_pos, phases):
