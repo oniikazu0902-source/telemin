@@ -3,7 +3,7 @@
 `telemin.py` ができるまでの試作版を、記録として残しているフォルダです。
 **現在のプログラムからは使われていません。** 実行するときは `telemin.py`（`start_telemin.bat`）を使ってください。
 
-これらのファイルはどれも `hand_landmarker.task` を同じフォルダから読み込みます。動かしたい場合は、リポジトリのルートで `python archive/2hands.py` のように実行するか、`hand_landmarker.task` をこのフォルダにコピーしてください。
+これらのファイルはどれも `hand_landmarker.task` を「実行したときのフォルダ」から読み込みます。動かしたい場合は、リポジトリのルート（`hand_landmarker.task` がある場所）で `python archive/2hands.py` のように実行してください。
 
 | ファイル | 最終更新 | 内容 |
 |---|---|---|
