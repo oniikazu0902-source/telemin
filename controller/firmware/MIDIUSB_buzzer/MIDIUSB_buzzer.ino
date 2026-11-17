@@ -98,6 +98,9 @@ int rawPotAverages[4] = {0, 0, 0, 0};
 unsigned long ledBlinkUntil = 0;
 
 bool displayReady = false;
+bool initialSyncSent = false;
+unsigned long mountedAtMs = 0;
+bool wasMounted = false;
 bool needDisplayUpdate = true;
 void updateDisplay();
 
@@ -139,14 +142,12 @@ void setup() {
   // MCP3004 ADC (ソフトウェアSPIで初期化)
   mcp.begin(MCP_SCK_PIN, MCP_MOSI_PIN, MCP_MISO_PIN, MCP_CS_PIN);
 
-  // ポット初期値読み取り＆PCへ初回送信
+  // ポット初期値読み取り（USB認識後の初回同期までは送信保留）
   for (int i = 0; i < 4; i++) {
     int adcCh = 3 - i; // 回路図: RV1->CH3, RV2->CH2, RV3->CH1, RV4->CH0
     int raw = mcp.readADC(adcCh);
     rawPotAverages[i] = raw;
-    int midiVal = constrain(map(raw, 0, 1023, 0, 127), 0, 127);
-    lastPotValues[i] = midiVal;
-    controlChange(MIDI_CHANNEL, potCCs[i], midiVal);
+    lastPotValues[i] = constrain(map(raw, 8, 1015, 0, 127), 0, 127);
   }
 
   // ブザーピン初期化
@@ -218,6 +219,22 @@ void loop() {
   MIDI.read();
   unsigned long now = millis();
 
+  // USBマウント完了後 1500ms 経過時に全つまみの現在値を初回同期送信
+  bool isMounted = TinyUSBDevice.mounted();
+  if (isMounted && !wasMounted) {
+    mountedAtMs = now;
+    initialSyncSent = false;
+  }
+  wasMounted = isMounted;
+
+  if (isMounted && !initialSyncSent && (now - mountedAtMs >= 1500)) {
+    initialSyncSent = true;
+    for (int i = 0; i < 4; i++) {
+      controlChange(MIDI_CHANNEL, potCCs[i], lastPotValues[i]);
+    }
+    needDisplayUpdate = true;
+  }
+
   // 1. ボタン8つの処理（設定書き換えコマンド送信）
   for (int i = 0; i < NUM_BUTTONS; i++) {
     int reading = digitalRead(buttonPins[i]);
@@ -251,9 +268,9 @@ void loop() {
     int adcCh = 3 - i;
     int raw = mcp.readADC(adcCh);
 
-    // 指数移動平均フィルタ (ノイズ低減)
-    rawPotAverages[i] = (rawPotAverages[i] * 3 + raw) / 4;
-    int midiVal = map(rawPotAverages[i], 0, 1023, 0, 127);
+    // 四捨五入付き指数移動平均フィルタ（整数除算の1020頭打ち/126上限を防止）
+    rawPotAverages[i] = (rawPotAverages[i] * 3 + raw + 2) / 4;
+    int midiVal = map(rawPotAverages[i], 8, 1015, 0, 127);
     midiVal = constrain(midiVal, 0, 127);
 
     // 端点(0および127)は差が1でも確実に検知、それ以外はジッター防止で差が2以上

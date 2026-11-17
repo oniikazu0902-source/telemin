@@ -1,7 +1,27 @@
+import sys
 import time
 import threading
-import serial
 import mido
+
+try:
+    import serial
+    import serial.tools.list_ports
+except ImportError:
+    serial = None
+
+
+def find_pico_serial_port():
+    if len(sys.argv) > 1:
+        return sys.argv[1]
+    if serial is None:
+        return None
+    for p in serial.tools.list_ports.comports():
+        desc = f"{p.description} {p.manufacturer or ''} {p.hwid}".lower()
+        # Raspberry Pi Pico USB VID:PID = 2E8A
+        if "2e8a" in desc or "pico" in desc or "rp2040" in desc:
+            return p.device
+    return None
+
 
 print("=" * 60)
 print("  tElemin Controller Live Diagnostic Tool")
@@ -9,28 +29,34 @@ print("=" * 60)
 
 stop_event = threading.Event()
 
+
 def monitor_serial():
+    if serial is None:
+        print("[Serial] pyserial が未インストールのためシリアル監視をスキップします。")
+        return
+    port_name = find_pico_serial_port()
+    if not port_name:
+        print("[Serial] Pico のシリアルポートが自動検出できませんでした。(引数で COMポート 指定可)")
+        return
     try:
-        s = serial.Serial('COM5', 115200, timeout=0.5)
+        s = serial.Serial(port_name, 115200, timeout=0.5)
         s.dtr = True
         s.rts = True
-        print("[COM5] シリアルポートオープン成功。ハートビートを監視中...")
+        print(f"[{port_name}] シリアルポートオープン成功。ログを監視中...")
         while not stop_event.is_set():
             line = s.readline()
             if line:
                 text = line.decode('utf-8', errors='ignore').strip()
                 if "[MIDI TX]" in text:
                     print(f" >>> [Pico内部MIDI送信] {text}")
-                elif "[HEARTBEAT]" in text:
-                    # 変化があった場合や定期的に表示
-                    pass
             time.sleep(0.01)
         s.close()
     except Exception as e:
-        print(f"[COM5 Error] {e}")
+        print(f"[{port_name} Error] {e}")
+
 
 def monitor_midi():
-    pico_ports = [p for p in mido.get_input_names() if "pico" in p.lower()]
+    pico_ports = [p for p in mido.get_input_names() if any(kw in p.lower() for kw in ("pico", "telemin", "arduino"))]
     if not pico_ports:
         print("[MIDI Error] Pico MIDI入力ポートが見つかりません！")
         return
@@ -45,7 +71,7 @@ def monitor_midi():
     except Exception as e:
         print(f"[MIDI Error] {e}")
 
-# 別スレッドで両方を監視
+
 t_ser = threading.Thread(target=monitor_serial, daemon=True)
 t_midi = threading.Thread(target=monitor_midi, daemon=True)
 
@@ -57,7 +83,7 @@ print("お手元の基板のボタン（8個のキー）のどれかを押すか
 print("------------------------\n")
 
 try:
-    for i in range(30):
+    for _ in range(30):
         time.sleep(1)
 except KeyboardInterrupt:
     pass
