@@ -97,6 +97,21 @@
 #      - MIDI曲内のCC#7でマスター音量が勝手に上書きされないよう分離し、リミッター後の知覚音量（2乗カーブ）に修正。
 #      - Claude が実装した SoftSynth / OutputHub と Gemini の InternalSynth を synth.py で完全統合。
 #        outport.send() で Claude の STEP_MODE も外部MIDI/内部シンセ両方で問題なく鳴ります。
+#   4. 波形変更時の知覚音量（ラウドネス）均一化：
+#      - 矩形波やノコギリ波の倍音エネルギー・RMS特性による音量肥大化を解消するため、
+#        波形ごとに振幅補正ゲインを実測調整して揃えました。
+#
+# Claude へ（Gemini より 2026-11-17）:
+#   レビューで判明した不具合修正と、波形変更時の音量差の根本解消を行いました：
+#   - `synth.py`: `age`(経過秒数)と`order`(連番)を分離して Bell の極小音量とボイススティールを修正。
+#     ADSR を NumPy ベクトル化し、リリース終端クリック・`set_hand_pitch` デッドロック・高音エイリアシング(PolyBLEP)を修正。
+#     また全6波形の基本波位相を 0° に統一＋A特性ラウドネス基準でゲイン再調整し、モーフィング中間(-11.5dB急落)を含め音量を均一化。
+#     `master_cutoff`(つまみ RV2) と `ch_cutoff`(FILTER_MODE の CC#74) を分離して互いに干渉しないようにしました。
+#   - `telemin.py`: 重複起動を削除して `AUDIO_DEVICE` / `USE_MIDI_OUT`(既定 False) を有効化。
+#     `send_midi()` を `outport.send()` に統合し、ピンチ強度の CC#7 や一般 MIDI キーボード演奏を復活。
+#     重複していた `'o'` キーの片方（オクターブ切替）を `'v'` キーへ移し、`'o'` は出力デバイス切替に統一。
+#   - 検証状況: 単体計測(コールバック実測・A特性プローブ)と Pico 書き込みは実施済み。
+#     実カメラ・スピーカーでの通し演奏テストは環境都合上未実施です。
 # ------------------------------------------------------------------
 import cv2
 import numpy as np
@@ -116,34 +131,18 @@ from synth import SoftSynth, OutputHub
 # どこから起動しても hand_landmarker.task や songs/ を見つけられるよう、スクリプトの場所を基準にする
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-# 内部ソフトウェアシンセサイザーの起動 (超低遅延ストリーミング)
-try:
-    internal_synth = synth.InternalSynth(sample_rate=44100, blocksize=256)
-except Exception as e:
-    print(f"[WARNING] 内部シンセサイザーの初期化に失敗しました: {e}")
-    internal_synth = None
+# 出力先インスタンスは設定定数読み込み後（セクション2）に初期化する
+outport = None
+internal_synth = None
 
 def send_midi(msg):
-    """内部シンセサイザーへの直接発音・制御"""
-    if internal_synth is None:
+    """出力ハブ（内蔵シンセ ＆ 設定に応じて外部MIDI出力）へメッセージを送信"""
+    if outport is None:
         return
     try:
-        if msg.type == 'note_on':
-            if msg.velocity > 0:
-                internal_synth.note_on(msg.note, msg.velocity, channel=getattr(msg, 'channel', 0))
-            else:
-                internal_synth.note_off(msg.note, channel=getattr(msg, 'channel', 0))
-        elif msg.type == 'note_off':
-            internal_synth.note_off(msg.note, channel=getattr(msg, 'channel', 0))
-        elif msg.type == 'control_change':
-            if msg.control == 123:  # All Notes Off
-                internal_synth.all_notes_off()
-            elif msg.control == 10:  # Pan
-                internal_synth.set_pan(msg.value)
-            # 注意: CC 7 (Volume), CC 74 (Waveform), CC 71 (Cutoff), CC 73 (Release) は
-            # 物理コントローラー専用のマスター操作とするため、MIDI曲データによる勝手な上書きを防止
-    except Exception:
-        pass
+        outport.send(msg)
+    except Exception as e:
+        print(f"[MIDI送信エラー] {e}")
 
 
 # =======
@@ -226,8 +225,8 @@ USE_INTERNAL_SYNTH = True
 # 出力デバイス名の一部（例: "Headphones", "USB Audio"）。None なら Windows の既定の出力先。
 # 起動時にコンソールへデバイス一覧が出るので、そこから選ぶ。演奏中は 'o' キーで切り替え可能
 AUDIO_DEVICE = None
-# Vital などの外部シンセにも MIDI を送る場合は True（ポートが無ければ自動で内蔵シンセのみになる）
-USE_MIDI_OUT = True
+# Vital などの外部シンセにも MIDI を送る場合は True（既定は False = 内蔵シンセのみ）
+USE_MIDI_OUT = False
 MIDI_OUT_PORT = 'Default Basic App Loopback 1'
 
 # 波形変化モードのデフォルト状態
@@ -844,21 +843,34 @@ options = vision.HandLandmarkerOptions(
 )
 detector = vision.HandLandmarker.create_from_options(options)
 
-# 出力先は「内蔵シンセ（PCのオーディオ出力から直接発音）」と「MIDI出力ポート（Vital等）」の2系統。
+# 出力先は「内蔵シンセ（PCのオーディオ出力から直接発音）」と「MIDI出力ポート（オプション）」の2系統。
 # 両方とも OutputHub にまとめ、以降のコードは outport.send() / send_midi() するだけで届く。
 outputs = []
 
 # (1) 内蔵シンセ: PCのヘッドホン端子 / USB-DAC などから直接音を出す（Vital不要）
-synth = None
-try:
-    synth = SoftSynth()
-    outputs.append(synth)
-    internal_synth = synth  # 内部シンセ参照を共通化
-except Exception as e:
-    print(f"[WARNING] 内蔵シンセサイザーの初期化に失敗しました: {e}")
+internal_synth = None
+if USE_INTERNAL_SYNTH:
+    try:
+        internal_synth = SoftSynth(device=AUDIO_DEVICE)
+        outputs.append(internal_synth)
+    except Exception as e:
+        print(f"[WARNING] 内蔵シンセサイザーの初期化に失敗しました: {e}")
+
+# (2) 外部MIDI出力ポート（必要な場合のみ）
+if USE_MIDI_OUT:
+    try:
+        outputs.append(mido.open_output(MIDI_OUT_PORT))
+        print(f"MIDI出力ポート '{MIDI_OUT_PORT}' を開きました。")
+    except OSError:
+        print(f"MIDI出力ポート '{MIDI_OUT_PORT}' が見つかりません（内蔵シンセのみで発音します）。")
+
+if not outputs:
+    print("出力先がありません。USE_INTERNAL_SYNTH か USE_MIDI_OUT を True にしてください。")
+    exit()
 
 outport = OutputHub(outputs)
 inport = None
+inport_is_pico = False
 input_ports = mido.get_input_names()
 print("--- 利用可能なMIDI入力ポート ---")
 for port in input_ports:
@@ -870,18 +882,19 @@ for port in input_ports:
     if any(kw in port.lower() for kw in ["pico", "telemin", "arduino", "controller"]):
         try:
             inport = mido.open_input(port)
+            inport_is_pico = True
             print(f"★ 物理MIDIコントローラーとして '{port}' を接続しました！")
             break
         except Exception as e:
             print(f"ポート '{port}' のオープンに失敗: {e}")
 
-# 2. なければ他の物理コントローラーを探索
+# 2. なければ他の物理コントローラー（MIDIキーボード等）を探索
 if inport is None:
     for port in input_ports:
         if "loopback" not in port.lower() and "loopmidi" not in port.lower():
             try:
                 inport = mido.open_input(port)
-                print(f"MIDI入力コントローラーとして '{port}' を開きました。")
+                print(f"MIDI入力コントローラーとして '{port}' を開きました。（そのままシンセ発音）")
                 break
             except Exception:
                 pass
@@ -1172,82 +1185,61 @@ try:
 
 
         # ------------------------------------
-        # MIDIコントローラーからの入力を処理 (ボタン=設定変更, つまみ=音色変更)
+        # MIDIコントローラーからの入力を処理
+        #   - 専用コントローラー(Pico等): ボタン(CC20〜27)=設定変更, つまみ(CC74/71/73/7)=音色変更
+        #   - 一般の外部MIDIキーボード: そのままシンセへ送信して鍵盤演奏
         # ------------------------------------
         if inport is not None:
             for msg in inport.iter_pending():
-                if msg.type == 'control_change':
+                if inport_is_pico and msg.type == 'control_change':
                     # つまみ4つの音色変更
-                    if msg.control == 74 or msg.control == 14:  # RV1: 波形選択
+                    if msg.control == 74:     # RV1: 波形モーフィング
                         if internal_synth:
                             w_name = internal_synth.set_waveform_by_midi(msg.value)
                             show_toast(f"【音色/RV1】波形: {w_name}")
-                    elif msg.control == 71 or msg.control == 1:   # RV2: 音の明るさ(Cutoff)
+                    elif msg.control == 71:   # RV2: 音の明るさ(マスターCutoff)
                         if internal_synth:
-                            pct = internal_synth.set_cutoff(msg.value)
+                            pct = internal_synth.set_cutoff_midi(msg.value)
                             show_toast(f"【音色/RV2】音の明るさ: {pct}%")
-                    elif msg.control == 73 or msg.control == 2:   # RV3: 余韻(Release)
+                    elif msg.control == 73:   # RV3: 余韻(Release)
                         if internal_synth:
-                            sec = internal_synth.set_release_time(msg.value)
+                            sec = internal_synth.set_release_midi(msg.value)
                             show_toast(f"【音色/RV3】余韻(Release): {sec}秒")
-                    elif msg.control == 7:                        # RV4: マスター音量
+                    elif msg.control == 7:    # RV4: マスター音量
                         if internal_synth:
-                            vol = internal_synth.set_master_volume(msg.value)
+                            vol = internal_synth.set_master_volume_midi(msg.value)
                             show_toast(f"【音色/RV4】音量: {vol}%")
 
-                    # ボタン8つの設定変更 (CC 20〜27)
-                    elif msg.control == 20:  # SW1: スケール切替
+                    # ボタン8つの設定変更 (CC 20〜27, 押下時 value > 0 のみ反応)
+                    elif msg.control == 20 and msg.value > 0:  # SW1: スケール切替
                         cycle_scale()
-                    elif msg.control == 21:  # SW2: 和音モード切替
+                    elif msg.control == 21 and msg.value > 0:  # SW2: 和音モード切替
                         CHORD_MODE = not CHORD_MODE
                         show_toast(f"【設定変更/SW2】和音モード: {'ON' if CHORD_MODE else 'OFF'}")
-                    elif msg.control == 22:  # SW3: ストラム演奏切替
+                    elif msg.control == 22 and msg.value > 0:  # SW3: ストラム演奏切替
                         STRUM_MODE = not STRUM_MODE
                         show_toast(f"【設定変更/SW3】ストラム奏法: {'ON' if STRUM_MODE else 'OFF'}")
-                    elif msg.control == 23:  # SW4: オクターブ切替
+                    elif msg.control == 23 and msg.value > 0:  # SW4: オクターブ切替
                         cycle_octave()
-                    elif msg.control == 24:  # SW5: 自動演奏 ON/OFF
+                    elif msg.control == 24 and msg.value > 0:  # SW5: 自動演奏 ON/OFF
                         AUTO_PLAY_ENABLED = not AUTO_PLAY_ENABLED
                         if not AUTO_PLAY_ENABLED:
                             auto_player.pause()
                         show_toast(f"【設定変更/SW5】自動演奏: {'ON' if AUTO_PLAY_ENABLED else 'OFF'}")
-                    elif msg.control == 25:  # SW6: 次の曲
+                    elif msg.control == 25 and msg.value > 0:  # SW6: 次の曲
                         auto_player.next_song()
                         show_toast(f"【設定変更/SW6】次曲: {auto_player.get_current_title()}")
-                    elif msg.control == 26:  # SW7: 前の曲
+                    elif msg.control == 26 and msg.value > 0:  # SW7: 前の曲
                         auto_player.prev_song()
                         show_toast(f"【設定変更/SW7】前曲: {auto_player.get_current_title()}")
-                    elif msg.control == 27:  # SW8: レインボー切替
+                    elif msg.control == 27 and msg.value > 0:  # SW8: レインボー切替
                         RAINBOW_LANES = not RAINBOW_LANES
                         show_toast(f"【設定変更/SW8】虹色レーン: {'ON' if RAINBOW_LANES else 'OFF'}")
-
-                elif msg.type == 'note_on' and msg.velocity > 0:
-                    # Note仕様(60〜67)でもボタン設定切り替えとして完全対応
-                    btn_idx = msg.note - 60
-                    if btn_idx == 0:   # SW1: スケール切替
-                        cycle_scale()
-                    elif btn_idx == 1: # SW2: 和音モード切替
-                        CHORD_MODE = not CHORD_MODE
-                        show_toast(f"【設定変更/SW2】和音モード: {'ON' if CHORD_MODE else 'OFF'}")
-                    elif btn_idx == 2: # SW3: ストラム演奏切替
-                        STRUM_MODE = not STRUM_MODE
-                        show_toast(f"【設定変更/SW3】ストラム奏法: {'ON' if STRUM_MODE else 'OFF'}")
-                    elif btn_idx == 3: # SW4: オクターブ切替
-                        cycle_octave()
-                    elif btn_idx == 4: # SW5: 自動演奏 ON/OFF
-                        AUTO_PLAY_ENABLED = not AUTO_PLAY_ENABLED
-                        if not AUTO_PLAY_ENABLED:
-                            auto_player.pause()
-                        show_toast(f"【設定変更/SW5】自動演奏: {'ON' if AUTO_PLAY_ENABLED else 'OFF'}")
-                    elif btn_idx == 5: # SW6: 次の曲
-                        auto_player.next_song()
-                        show_toast(f"【設定変更/SW6】次曲: {auto_player.get_current_title()}")
-                    elif btn_idx == 6: # SW7: 前の曲
-                        auto_player.prev_song()
-                        show_toast(f"【設定変更/SW7】前曲: {auto_player.get_current_title()}")
-                    elif btn_idx == 7: # SW8: レインボー切替
-                        RAINBOW_LANES = not RAINBOW_LANES
-                        show_toast(f"【設定変更/SW8】虹色レーン: {'ON' if RAINBOW_LANES else 'OFF'}")
+                    else:
+                        send_midi(msg)
+                else:
+                    # 一般の外部MIDIキーボード入力やノート信号はそのままシンセ/MIDI出力へスルー
+                    send_midi(msg)
 
         # ------------------------------------
         # 手の位置から音程を計算してMIDI送信
@@ -1651,7 +1643,7 @@ try:
             draw_button(image, "6. Miyakobushi Scale", 320, 190, 280, 40, CURRENT_KEY == 'Miyakobushi')
 
             # モード切替トグルボタン (上段)
-            wave_name = internal_synth.get_waveform_name() if internal_synth else "Default"
+            wave_name = internal_synth.get_waveform_name().split(' (')[0].replace('→', '->') if internal_synth else "Default"
             draw_button(image, f"VOICE [W]: {wave_name}", 40, 250, 320, 45, True, active_color=(0, 255, 255))
             draw_button(image, f"STRUM: {'ON' if STRUM_MODE else 'OFF'}", 380, 250, 140, 45, STRUM_MODE)
             draw_button(image, f"AUTO: {'ON' if AUTO_PLAY_ENABLED else 'OFF'}", 535, 250, 140, 45, AUTO_PLAY_ENABLED)
@@ -1796,7 +1788,7 @@ try:
                 else:
                     WAVE_MODE = not WAVE_MODE
                     show_toast(f"【切替】波形モード: {'ON' if WAVE_MODE else 'OFF'}")
-            elif key == ord('o'):
+            elif key == ord('v'):
                 cycle_octave()
             elif key == ord('h'):
                 STRUM_MODE = not STRUM_MODE
@@ -1866,10 +1858,11 @@ finally:
     for state in hand_states:
         release_hand(state)
 
-    # 内部シンセサイザーの完全停止
+    # シンセサイザー・MIDI出力の完全停止
     if internal_synth is not None:
         internal_synth.all_notes_off()
-        internal_synth.close()
+    if outport is not None:
+        outport.close()
 
     if inport is not None:
         inport.close()
