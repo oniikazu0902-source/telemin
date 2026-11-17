@@ -6,3 +6,4 @@ numpy
 Pillow
 sounddevice
 scipy
+pyserial
